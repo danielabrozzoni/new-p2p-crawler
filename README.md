@@ -43,6 +43,7 @@ cargo build --release
 | `--no-record-addr-responses` | on | stop logging every `addr`/`addrv2` reply (recording is on by default) |
 | `--ip/-tor/-i2p-concurrency` | 512/64/32 | workers per transport |
 | `--result-path` | `results` | output directory |
+| `--checkpoint-interval` | `10m` | re-write result files this often (`0` = off) |
 
 Run `--help` for the full, sectioned list.
 
@@ -57,3 +58,10 @@ Each run writes into its own subdirectory of the result dir, named
 - `crawler_stats.json` — settings + crawl-wide counts and node lists
 - `addr_responses.csv` — on by default; disable with `--no-record-addr-responses`
 - `debug_log.txt` — optional, on by default
+
+The snapshot files (`reachable`/`handshake_failed`/`unreachable`/`crawler_stats`)
+are written when the crawl finishes, and also re-written every
+`--checkpoint-interval` while it runs, so a crash or hard kill still leaves recent
+output. Pressing **Ctrl+C** starts a graceful shutdown: in-flight nodes are
+allowed to finish, then the final output is written. A **second Ctrl+C**
+force-quits immediately without writing.

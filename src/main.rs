@@ -152,7 +152,7 @@ async fn async_main(settings: Arc<Settings>) -> ExitCode {
     ));
 
     // Resolve DNS seeds into the initial Queued entries (Section 3.1).
-    let seed_results = seed_from_dns(&crawler, &settings).await;
+    let seed_results = Arc::new(seed_from_dns(&crawler, &settings).await);
 
     let total_seeded: usize = seed_results.iter().map(|s| s.addrs.len()).sum();
     tracing::info!(
@@ -161,8 +161,19 @@ async fn async_main(settings: Arc<Settings>) -> ExitCode {
         total_seeded
     );
 
+    // Periodically checkpoint the snapshot result files so a hard kill or crash
+    // still leaves recent output. Ctrl+C is handled inside `run()` and writes a
+    // final, consistent snapshot below.
+    let checkpoint = spawn_checkpoint(&crawler, &store, &settings, &seed_results);
+
     // Run the crawl (Sections 3.5–3.6).
     Arc::clone(&crawler).run().await;
+
+    // Stop checkpointing before the final write so they can't overlap.
+    if let Some(task) = checkpoint {
+        task.abort();
+        let _ = task.await;
+    }
 
     let runtime_seconds = crawler.start_clock.elapsed().as_secs() as i64;
     let num_processed = crawler.num_processed();
@@ -188,6 +199,38 @@ async fn async_main(settings: Arc<Settings>) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Spawn a background task that re-writes the snapshot result files every
+/// `checkpoint_interval` seconds (disabled when 0). Guards against a hard kill
+/// or crash where the final write never runs.
+fn spawn_checkpoint(
+    crawler: &Arc<Crawler>,
+    store: &Arc<NodeStore>,
+    settings: &Arc<Settings>,
+    seeds: &Arc<Vec<SeedResult>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if settings.checkpoint_interval <= 0 {
+        return None;
+    }
+    let interval = std::time::Duration::from_secs(settings.checkpoint_interval as u64);
+    let crawler = Arc::clone(crawler);
+    let store = Arc::clone(store);
+    let settings = Arc::clone(settings);
+    let seeds = Arc::clone(seeds);
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // first tick is immediate; skip so the first write is one interval in
+        loop {
+            ticker.tick().await;
+            let runtime = crawler.start_clock.elapsed().as_secs() as i64;
+            let processed = crawler.num_processed();
+            match output::write_all(&store, &settings, &seeds, runtime, processed) {
+                Ok(()) => tracing::info!("checkpoint: result files written ({processed} processed)"),
+                Err(e) => tracing::warn!("checkpoint write failed: {e}"),
+            }
+        }
+    }))
 }
 
 /// Resolve every DNS seed and enqueue the enabled-network initial addresses.

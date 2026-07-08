@@ -35,6 +35,9 @@ pub struct Settings {
     pub store_debug_log: bool,
     #[serde(skip)]
     pub retry_on_timeout: bool,
+    /// Re-write the snapshot result files this often (seconds); 0 disables.
+    #[serde(skip)]
+    pub checkpoint_interval: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -306,6 +309,9 @@ pub struct Cli {
     /// Do not write the plain-text debug log file (written by default)
     #[arg(long, help_heading = "Output & logging")]
     no_store_debug_log: bool,
+    /// Re-write result files this often as a checkpoint; seconds or 5m/1h; 0 disables
+    #[arg(long, default_value = "10m", help_heading = "Output & logging")]
+    checkpoint_interval: String,
 }
 
 impl Cli {
@@ -322,6 +328,8 @@ impl Cli {
         });
 
         let record_addr_responses = self.record_addr_responses && !self.no_record_addr_responses;
+
+        let checkpoint_interval = parse_duration(&self.checkpoint_interval)?;
 
         // Networks are on by default; `--<net>`/`--no-<net>` override each other,
         // so the negative flag alone decides enablement.
@@ -397,6 +405,7 @@ impl Cli {
             log_level: self.log_level,
             store_debug_log: !self.no_store_debug_log,
             retry_on_timeout: self.retry_on_timeout,
+            checkpoint_interval,
         })
     }
 }

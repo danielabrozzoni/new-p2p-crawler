@@ -13,7 +13,7 @@ use crate::transport::{
     connect_socks5, connect_tcp, Connection, SamSession,
 };
 use rand::seq::SliceRandom;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
@@ -68,6 +68,9 @@ pub struct Crawler {
     addr_log: Option<Arc<AddrLog>>,
     /// Crawl start clock (Section 3.8).
     pub start_clock: Instant,
+    /// Set when a shutdown was requested (e.g. Ctrl+C): workers stop pulling new
+    /// work after finishing their current node, so the crawl drains and exits.
+    shutdown: AtomicBool,
 }
 
 impl Crawler {
@@ -84,6 +87,7 @@ impl Crawler {
             sam: OnceCell::new(),
             addr_log,
             start_clock: Instant::now(),
+            shutdown: AtomicBool::new(false),
         }
     }
 
@@ -147,6 +151,12 @@ impl Crawler {
             tokio::spawn(async move { me.monitor_loop().await })
         };
 
+        // Ctrl+C handler: first press drains gracefully, second force-quits.
+        let signals = {
+            let me = Arc::clone(&self);
+            tokio::spawn(async move { me.signal_loop().await })
+        };
+
         for h in handles {
             let _ = h.await;
         }
@@ -157,12 +167,40 @@ impl Crawler {
         // this abort is a no-op.
         monitor.abort();
         let _ = monitor.await;
+        signals.abort();
+        let _ = signals.await;
+    }
+
+    /// Wait for Ctrl+C. The first one requests a graceful drain (workers finish
+    /// their in-flight node, then stop); a second one force-quits immediately,
+    /// abandoning in-flight work and any not-yet-written output.
+    async fn signal_loop(self: &Arc<Self>) {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        tracing::warn!(
+            "Ctrl+C received: shutting down gracefully, draining in-flight nodes then writing output (press Ctrl+C again to force-quit)"
+        );
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Unblock workers idle on an empty queue so they observe the flag.
+        self.queues.close_all();
+
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        tracing::warn!("second Ctrl+C received: force-quitting without writing output");
+        std::process::exit(130);
     }
 
     /// A single worker's loop bound to transport `t` (Section 3.5 pseudocode).
     async fn worker_loop(self: &Arc<Self>, t: Transport) {
         let rx = self.queues.receiver(t).clone();
         loop {
+            // Shutdown requested (Ctrl+C): stop after the current node, leaving
+            // any still-queued addresses untouched.
+            if self.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
             // Test cap: stop taking work and wake everyone (Section 3.6).
             if let Some(max) = self.settings.max_nodes {
                 if self.num_processed() >= max {
