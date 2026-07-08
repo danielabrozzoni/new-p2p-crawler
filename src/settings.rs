@@ -219,10 +219,15 @@ pub struct Cli {
     /// Disable the freshness filter (shorthand for --freshness-threshold 0)
     #[arg(long, help_heading = "Crawl behavior")]
     no_freshness_filter: bool,
-    /// Log every addr/addrv2 response to a CSV (largest output; off by default)
-    #[arg(long, overrides_with = "no_record_addr_responses", help_heading = "Crawl behavior")]
+    /// Log every addr/addrv2 response to a CSV (on by default; largest output)
+    #[arg(
+        long,
+        default_value_t = true,
+        overrides_with = "no_record_addr_responses",
+        help_heading = "Crawl behavior"
+    )]
     record_addr_responses: bool,
-    /// Do not record addr responses (overrides --record-addr-responses)
+    /// Do not record addr responses (disables the on-by-default recording)
     #[arg(long, help_heading = "Crawl behavior")]
     no_record_addr_responses: bool,
     /// Also retry a node that stayed silent for the whole handshake deadline

@@ -40,7 +40,7 @@ cargo build --release
 | `--max-nodes N` | unlimited | stop after ~N processed nodes (testing cap) |
 | `--no-<net>` | — | disable a network (`ipv4`/`ipv6`/`tor`/`i2p`/`cjdns`) |
 | `--freshness-threshold` | `2d` | skip addrs last-seen older than this (`0` = off) |
-| `--record-addr-responses` | off | log every `addr`/`addrv2` reply |
+| `--no-record-addr-responses` | on | stop logging every `addr`/`addrv2` reply (recording is on by default) |
 | `--ip/-tor/-i2p-concurrency` | 512/64/32 | workers per transport |
 | `--result-path` | `results` | output directory |
 
@@ -54,5 +54,5 @@ Written to the result dir, prefixed `<timestamp>_v<version>_`:
 - `handshake_failed_nodes.csv` — connected but no `version`
 - `unreachable_nodes.csv` — never connected
 - `crawler_stats.json` — settings + crawl-wide counts and node lists
-- `addr_responses.csv` — optional, `--record-addr-responses`
+- `addr_responses.csv` — on by default; disable with `--no-record-addr-responses`
 - `debug_log.txt` — optional, on by default
