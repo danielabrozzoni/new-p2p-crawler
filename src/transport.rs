@@ -99,9 +99,17 @@ fn parse_command(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Connect a plain TCP stream to `host:port` (Section 4.2).
+///
+/// IPv4/IPv6/CJDNS hosts are always numeric literals, so parse straight to a
+/// `SocketAddr` (no `getaddrinfo`) — this also avoids the unbracketed-IPv6
+/// pitfall of `"host:port"` string parsing, which would otherwise force a DNS
+/// lookup on every IPv6/CJDNS connect.
 pub async fn connect_tcp(host: &str, port: u16, connect_timeout: Duration) -> io::Result<TcpStream> {
-    let addr = format!("{host}:{port}");
-    let stream = timeout(connect_timeout, TcpStream::connect(&addr))
+    let ip: std::net::IpAddr = host
+        .parse()
+        .map_err(|_| io::Error::other(format!("not a numeric IP address: {host}")))?;
+    let addr = std::net::SocketAddr::new(ip, port);
+    let stream = timeout(connect_timeout, TcpStream::connect(addr))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp connect timed out"))??;
     let _ = stream.set_nodelay(true);
