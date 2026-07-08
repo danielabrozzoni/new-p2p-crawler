@@ -35,13 +35,11 @@ fn main() -> ExitCode {
         }
     };
 
-    // Sanity-check: create the results directory if missing (Section 2.4 step 1).
+    // Sanity-check: create this run's results directory if missing (Section 2.4 step 1).
     if !settings.dry_run {
-        if let Err(e) = std::fs::create_dir_all(&settings.result_settings.path) {
-            eprintln!(
-                "cannot create results directory {}: {e}",
-                settings.result_settings.path
-            );
+        let run_dir = settings.run_dir();
+        if let Err(e) = std::fs::create_dir_all(&run_dir) {
+            eprintln!("cannot create results directory {}: {e}", run_dir.display());
             return ExitCode::from(EXIT_CONFIG_ERROR);
         }
     }
@@ -72,8 +70,7 @@ fn init_logging(settings: &Settings) -> Option<tracing_appender::non_blocking::W
 
     // Optional plain-text debug log file (Section 8.6).
     let (file_layer, guard) = if settings.store_debug_log && !settings.dry_run {
-        let filename = format!("{}_debug_log.txt", settings.prefix());
-        let path = std::path::Path::new(&settings.result_settings.path).join(filename);
+        let path = settings.output_path("debug_log.txt");
         match std::fs::File::create(&path) {
             Ok(file) => {
                 let (nb, guard) = tracing_appender::non_blocking(file);
@@ -136,12 +133,7 @@ async fn async_main(settings: Arc<Settings>) -> ExitCode {
     // Build the store and (optional) addr-response log.
     let store = Arc::new(NodeStore::new());
     let addr_log = if settings.record_addr_responses {
-        let filename = format!(
-            "{}_{}",
-            settings.prefix(),
-            settings.result_settings.addr_responses
-        );
-        let path = std::path::Path::new(&settings.result_settings.path).join(filename);
+        let path = settings.output_path(&settings.result_settings.addr_responses);
         match AddrLog::create(&path) {
             Ok(log) => Some(Arc::new(log)),
             Err(e) => {

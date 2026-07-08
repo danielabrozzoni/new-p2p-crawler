@@ -34,11 +34,10 @@ pub fn write_all(
     num_processed: usize,
 ) -> anyhow::Result<()> {
     let snapshot = store.snapshot();
-    let prefix = settings.prefix();
 
-    write_reachable(&snapshot, settings, &prefix)?;
-    write_handshake_failed(&snapshot, settings, &prefix)?;
-    write_unreachable(&snapshot, settings, &prefix)?;
+    write_reachable(&snapshot, settings)?;
+    write_handshake_failed(&snapshot, settings)?;
+    write_unreachable(&snapshot, settings)?;
     write_stats_json(
         &snapshot,
         store,
@@ -46,19 +45,17 @@ pub fn write_all(
         seeds,
         runtime_seconds,
         num_processed,
-        &prefix,
     )?;
     Ok(())
 }
 
-fn out_path(settings: &Settings, prefix: &str, file: &str) -> std::path::PathBuf {
-    settings.output_path(&format!("{prefix}_{file}"))
+fn out_path(settings: &Settings, file: &str) -> std::path::PathBuf {
+    settings.output_path(file)
 }
 
 fn write_reachable(
     snapshot: &[(AddrKey, NodeEntry)],
     settings: &Settings,
-    prefix: &str,
 ) -> anyhow::Result<()> {
     let mut rows: Vec<&(AddrKey, NodeEntry)> = snapshot
         .iter()
@@ -71,7 +68,7 @@ fn write_reachable(
     // Sorted ascending by handshake_timestamp (Section 8.1).
     rows.sort_by_key(|(_, e)| e.handshake.as_ref().map(|h| h.handshake_timestamp).unwrap_or(0));
 
-    let path = out_path(settings, prefix, &settings.result_settings.reachable_nodes);
+    let path = out_path(settings, &settings.result_settings.reachable_nodes);
     let mut w = csv_writer(&path)?;
     w.write_record([
         "host",
@@ -130,7 +127,6 @@ fn write_reachable(
 fn write_handshake_failed(
     snapshot: &[(AddrKey, NodeEntry)],
     settings: &Settings,
-    prefix: &str,
 ) -> anyhow::Result<()> {
     let mut rows: Vec<&(AddrKey, NodeEntry)> = snapshot
         .iter()
@@ -143,11 +139,7 @@ fn write_handshake_failed(
     // Sorted ascending by handshake_timestamp (Section 8.2).
     rows.sort_by_key(|(_, e)| e.stats.first_version_send_ts.unwrap_or(0));
 
-    let path = out_path(
-        settings,
-        prefix,
-        &settings.result_settings.handshake_failed_nodes,
-    );
+    let path = out_path(settings, &settings.result_settings.handshake_failed_nodes);
     let mut w = csv_writer(&path)?;
     w.write_record([
         "host",
@@ -177,7 +169,6 @@ fn write_handshake_failed(
 fn write_unreachable(
     snapshot: &[(AddrKey, NodeEntry)],
     settings: &Settings,
-    prefix: &str,
 ) -> anyhow::Result<()> {
     let mut rows: Vec<&(AddrKey, NodeEntry)> = snapshot
         .iter()
@@ -190,7 +181,7 @@ fn write_unreachable(
     // Sorted ascending by freshest_timestamp (Section 8.3).
     rows.sort_by_key(|(_, e)| e.freshest_ts);
 
-    let path = out_path(settings, prefix, &settings.result_settings.unreachable_nodes);
+    let path = out_path(settings, &settings.result_settings.unreachable_nodes);
     let mut w = csv_writer(&path)?;
     w.write_record(["host", "port", "network", "handshake_attempts", "freshest_timestamp"])?;
     for (key, e) in rows {
@@ -242,7 +233,6 @@ fn write_stats_json(
     seeds: &[SeedResult],
     runtime_seconds: i64,
     num_processed: usize,
-    prefix: &str,
 ) -> anyhow::Result<()> {
     // Terminal-state breakdowns.
     let mut reachable = NetworkBreakdown::default();
@@ -325,7 +315,7 @@ fn write_stats_json(
     root.insert("list_nodes_from_seed".to_string(), Value::Object(list_from_seed));
 
     // Pretty-print with 4-space indent (Section 8.4).
-    let path = out_path(settings, prefix, &settings.result_settings.crawler_stats);
+    let path = out_path(settings, &settings.result_settings.crawler_stats);
     let file = std::fs::File::create(&path)?;
     let mut writer = std::io::BufWriter::new(file);
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");

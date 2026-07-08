@@ -48,7 +48,8 @@ Run `--help` for the full, sectioned list.
 
 ## Output
 
-Written to the result dir, prefixed `<timestamp>_v<version>_`:
+Each run writes into its own subdirectory of the result dir, named
+`<timestamp>_v<version>` (the time the run started), containing:
 
 - `reachable_nodes.csv` — connected + handshake completed, full metadata
 - `handshake_failed_nodes.csv` — connected but no `version`

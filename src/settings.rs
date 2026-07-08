@@ -119,9 +119,16 @@ impl Settings {
         }
     }
 
-    /// Full path of an output file under the result directory.
+    /// Per-run output directory: `<path>/<prefix>`. Each crawl gets its own
+    /// directory named after the timestamp it started at, so runs are not
+    /// mixed together.
+    pub fn run_dir(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.result_settings.path).join(self.prefix())
+    }
+
+    /// Full path of an output file under this run's output directory.
     pub fn output_path(&self, file: &str) -> std::path::PathBuf {
-        std::path::Path::new(&self.result_settings.path).join(file)
+        self.run_dir().join(file)
     }
 
     pub fn prefix(&self) -> String {
