@@ -1,0 +1,25 @@
+[package]
+name = "new-p2p-crawler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+dashmap = "6"
+sha2 = "0.10"
+sha3 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rand = "0.8"
+data-encoding = "2"
+csv = "1"
+async-channel = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+tracing-appender = "0.2"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3

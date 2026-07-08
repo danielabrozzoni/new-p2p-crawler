@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target
+
+# Nix build outputs
+/result
+/result-*
+.direnv/
+
+# Crawler output (result files, logs)
+/results/
+/scratch_results/
+*.log
+
+# Editor / OS junk
+*.swp
+.DS_Store
