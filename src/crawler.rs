@@ -471,17 +471,17 @@ impl Crawler {
                 Ok(Some(env)) => match env.command.as_str() {
                     "addr" => {
                         let addrs = parse_addr(&env.payload);
-                        let full = addrs.len() >= MAX_ADDR_TO_SEND;
+                        let n = addrs.len();
                         self.handle_addr_message(key, "addr", &addrs, hd).await;
-                        if !full {
-                            break; // sub-1000: dump complete (Section 3.3 early exit)
+                        if is_getaddr_reply_complete(n) {
+                            break;
                         }
                     }
                     "addrv2" => {
                         let addrs = parse_addrv2(&env.payload);
-                        let full = addrs.len() >= MAX_ADDR_TO_SEND;
+                        let n = addrs.len();
                         self.handle_addr_message(key, "addrv2", &addrs, hd).await;
-                        if !full {
+                        if is_getaddr_reply_complete(n) {
                             break;
                         }
                     }
@@ -635,6 +635,25 @@ fn classify_handshake_error(e: &std::io::Error) -> FailKind {
     }
 }
 
+/// Decide whether an addr/addrv2 message of length `n` completes the getaddr
+/// reply, so the collection loop can stop early instead of waiting for the idle
+/// timeout.
+///
+/// The discriminator is *substance*, not chunk size. Bitcoin Core sends its
+/// self-announcement (the peer's own address) as its own standalone message of
+/// exactly one address, right alongside the getaddr reply (net_processing.cpp
+/// `MaybeSendAddr`). A length-based "sub-1000 means done" test would break on
+/// that self-announcement and miss the real dump, so instead:
+///   - `n >= MAX_ADDR_TO_SEND`: a full chunk; more may follow, keep reading.
+///   - `1 < n < MAX_ADDR_TO_SEND`: the substantive final chunk, we are done.
+///   - `n <= 1`: a self-announcement (or empty); ignore and keep waiting for the
+///     real reply, falling back to the idle timeout if none arrives.
+///
+/// This mirrors Core's own AddrFetch completion rule (`vAddr.size() > 1`).
+fn is_getaddr_reply_complete(n: usize) -> bool {
+    n > 1 && n < MAX_ADDR_TO_SEND
+}
+
 /// Current UNIX epoch seconds.
 pub fn now_epoch() -> i64 {
     std::time::SystemTime::now()
@@ -691,6 +710,18 @@ mod tests {
             classify_connect_error(&Error::from_raw_os_error(113), NetworkType::Ipv4),
             FailKind::ConnectUnreachable
         );
+    }
+
+    #[test]
+    fn getaddr_reply_completion_ignores_self_announcements() {
+        // Self-announcement (1 addr) or empty: not the dump, keep waiting.
+        assert!(!is_getaddr_reply_complete(0));
+        assert!(!is_getaddr_reply_complete(1));
+        // Substantive, non-full chunk: the reply is complete.
+        assert!(is_getaddr_reply_complete(2));
+        assert!(is_getaddr_reply_complete(MAX_ADDR_TO_SEND - 1));
+        // Full chunk: more may follow, keep reading.
+        assert!(!is_getaddr_reply_complete(MAX_ADDR_TO_SEND));
     }
 
     #[test]
