@@ -64,7 +64,7 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_CONFIG_ERROR);
     }
 
-    let settings = match cli.common.into_settings(0, None, true) {
+    let settings = match cli.common.into_settings(0, None, false, true) {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("configuration error: {e}");
@@ -105,6 +105,12 @@ fn main() -> ExitCode {
 }
 
 async fn async_main(settings: Arc<Settings>, targets: Vec<AddrKey>) -> ExitCode {
+    // Optional startup delay for local Tor/I2P warm-up before probing.
+    if settings.delay_start > 0 {
+        tracing::info!("delaying start by {}s", settings.delay_start);
+        tokio::time::sleep(std::time::Duration::from_secs(settings.delay_start)).await;
+    }
+
     let store = Arc::new(NodeStore::new());
     // No addr-response log: probe mode never issues getaddr.
     let crawler = Arc::new(Crawler::new(Arc::clone(&store), Arc::clone(&settings), None));

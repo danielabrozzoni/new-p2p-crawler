@@ -154,6 +154,9 @@ pub struct Cli {
     #[command(flatten)]
     pub common: CommonArgs,
 
+    /// Run network preflight probes, print the table, and exit without crawling
+    #[arg(long, help_heading = "Crawl behavior")]
+    dry_run: bool,
     /// Stop after processing at most N nodes (testing cap; default unlimited)
     #[arg(long, value_name = "N", help_heading = "Crawl behavior")]
     max_nodes: Option<usize>,
@@ -235,9 +238,6 @@ pub struct CommonArgs {
     i2p_concurrency: usize,
 
     // ---- Crawl behavior ----
-    /// Run network preflight probes, print the table, and exit without crawling
-    #[arg(long, help_heading = "Crawl behavior")]
-    dry_run: bool,
     /// Total version-handshake attempts per node before giving up
     #[arg(long, default_value_t = 3, help_heading = "Crawl behavior")]
     handshake_attempts: u32,
@@ -338,18 +338,20 @@ impl Cli {
             parse_duration(&self.freshness_threshold)?
         };
         self.common
-            .into_settings(freshness_threshold, self.max_nodes, false)
+            .into_settings(freshness_threshold, self.max_nodes, self.dry_run, false)
     }
 }
 
 impl CommonArgs {
     /// Build the immutable [`Settings`] tree from the shared args plus the
-    /// caller-supplied crawl-only knobs. `probe_mode` is set by the `probe`
-    /// binary to disable peer discovery (getaddr).
+    /// caller-supplied crawl-only knobs. `dry_run` and `max_nodes` are
+    /// crawler-only (the `probe` binary passes `false`/`None`); `probe_mode` is
+    /// set by the `probe` binary to disable peer discovery (getaddr).
     pub fn into_settings(
         self,
         freshness_threshold: i64,
         max_nodes: Option<usize>,
+        dry_run: bool,
         probe_mode: bool,
     ) -> anyhow::Result<Settings> {
         let timestamp = self.timestamp.unwrap_or_else(|| {
@@ -430,7 +432,7 @@ impl CommonArgs {
                 crawler_stats: "crawler_stats.json".to_string(),
                 addr_responses: "addr_responses.csv".to_string(),
             },
-            dry_run: self.dry_run,
+            dry_run,
             log_level: self.log_level,
             store_debug_log: !self.no_store_debug_log,
             retry_on_timeout: self.retry_on_timeout,
