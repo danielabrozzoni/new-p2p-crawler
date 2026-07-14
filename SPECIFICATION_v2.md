@@ -120,7 +120,7 @@ truth.
                           ▼
    [ per-transport worker pools, each draining its own transport's work queue ]
                           │
-             connect ─────┤── fail ──> state=Unreachable
+             connect ─────┤── fail ──> retry (re-Queue) or give up ──> state=Unreachable/HandshakeFailed
                           │
            handshake ─────┤── fail ──> retry (re-Queue) or give up ──> state=HandshakeFailed
                           │ success
@@ -238,7 +238,8 @@ Each seed observation also updates the store's `freshest_ts` for that address to
 For each node pulled from the queue, a worker:
 
 1. **Connects** using the transport for the address type (Section 4.2) with the
-   per-network connect timeout. Connection failure ⇒ **Unreachable**.
+   per-network connect timeout. Connection failure ⇒ retry, then **Unreachable**
+   (or **HandshakeFailed** if an earlier attempt connected; Sections 3.7, 6.2).
 2. **Sends `version`**, recording the send timestamp and incrementing the
    handshake-attempt counter.
 3. **Waits for the peer's `version`** via the receive loop (Section 4.1) with
@@ -420,7 +421,12 @@ loop:
     num_processed_nodes += 1             // counts this processing iteration, incl. retries (3.6)
     entry.state = Processing             // still counted in `outstanding`
     if not connect(entry):
-        finish(entry, Unreachable)
+        // Connect failures retry too (6.2): a node that connected on an earlier
+        // attempt already proved reachable, so exhaustion here means
+        // HandshakeFailed, not Unreachable.
+        terminal = HandshakeFailed if entry.stats.time_connect_ms is set else Unreachable
+        if attempts_left(entry): entry.state = Queued; queue[T].send(key)
+        else:                    finish(entry, terminal)
     else if not handshake(entry):
         if attempts_left(entry): entry.state = Queued; queue[T].send(key)   // retry: outstanding unchanged
         else:                    finish(entry, HandshakeFailed)
@@ -466,14 +472,23 @@ Every processed node reaches exactly one terminal state:
   provenance, and connect timing are known — no `version`-derived fields, and no
   `getaddr` was ever sent. Semantically this means "something accepts TCP on this
   host:port," not necessarily a Bitcoin node.
-- **Unreachable**: the connection could not be established at all. Only address,
-  provenance, and attempt count are known.
+- **Unreachable**: the connection could not be established on any attempt. Only
+  address, provenance, and attempt count are known. If a node connected
+  successfully on an earlier attempt but then failed to connect on its last one,
+  it is filed as `HandshakeFailed` instead (Section 6.2) — it *did* prove
+  reachable at least once, so `Unreachable` would misrepresent it.
 
 Related transitions:
 
-- **Retry**: a connectable node whose handshake failed but which still has attempts
-  left is re-enqueued (`state = Queued`) rather than terminated; only after the
-  last attempt does it become `HandshakeFailed`.
+- **Retry**: a node whose connect or handshake attempt failed but which still has
+  attempts left is re-enqueued (`state = Queued`) rather than terminated; only
+  after the last attempt does it become terminal. A connect failure on the last
+  attempt becomes `Unreachable` normally, but `HandshakeFailed` if the node
+  connected successfully on an earlier attempt (Section 6.2) — a prior successful
+  connect is evidence "the connection could not be established at all" no longer
+  holds, and that evidence must not be discarded just because the final attempt
+  failed at an earlier stage. A handshake failure on the last attempt always
+  becomes `HandshakeFailed`.
 - **Stale**: when the freshness filter is enabled, an advertised address older than
   the threshold is set `StaleDiscarded` and not enqueued (reconsidered on later,
   fresher advertisements). When disabled, nothing is stale.
@@ -571,7 +586,8 @@ Over a fresh TCP connection to the proxy `host:port`:
    (DOMAINNAME ⇒ remote DNS), `<LEN>` 1-byte host length, `<HOST…>` ASCII `.onion`,
    `<PORT>` 2-byte **big-endian** (8333).
 4. **Reply** ← proxy: `05 <REP> 00 <ATYP> <BND.ADDR…> <BND.PORT>`. `REP=00` ⇒
-   success; non-zero ⇒ connection failure (Unreachable).
+   success; non-zero ⇒ connection failure, handled like any other connect
+   failure (retry-or-`Unreachable`, Section 6.2).
 5. On success the tunnel is transparent; the raw P2P envelope stream flows over it.
 
 The Tor **connect** timeout bounds the whole negotiation.
@@ -777,8 +793,27 @@ timeout `min(deadline − now, getaddr_idle)` and stops on the first idle timeou
   at 3). Sequence: attempt 1 fails → retry, 2 fails → retry, 3 fails → give up
   (`HandshakeFailed`). No backoff; the retry simply competes for selection later
   (re-enqueued).
-- **Retry only transient failures** (default). A host that **connects but then stays
-  silent for the whole handshake deadline** (Section 3.2 step 3) is *not* retried:
+- **Connect failures retry** like any other transient failure, up to
+  `handshake_attempts`, then give up as `Unreachable` — or `HandshakeFailed` if
+  an earlier attempt had connected successfully (Section 3.7). A connect
+  timeout/refusal is not reliable evidence of a dead peer — it can be
+  self-inflicted (e.g. a saturated worker pool causing legitimately-live peers to
+  blow past the connect timeout), so a single failed attempt does not condemn the
+  address. This applies uniformly to IP (TCP), Tor (SOCKS5), and I2P (SAM)
+  connects. The tradeoff mirrors the one made for handshake silence below: a
+  genuinely dead host can now cost up to `handshake_attempts × connect_timeout`
+  of worker time instead of one `connect_timeout` — most visible for Tor
+  (up to 3 × 100 s = 300 s per dead `.onion` by default) — which is accepted
+  because a connect failure, unlike a full-deadline handshake silence, is not
+  strong evidence the host is dead.
+  The requeue fallback (used if the crawl is shutting down when a retry would be
+  re-enqueued) always finishes with the *same* terminal state the exhausted-retry
+  path would have used, so a connect-stage retry racing shutdown still resolves
+  to `Unreachable`/`HandshakeFailed` correctly rather than being mislabeled as a
+  handshake-stage failure.
+- **Retry only transient failures past the connect stage** (default). A host that
+  **connects but then stays silent for the whole handshake deadline** (Section 3.2
+  step 3) is *not* retried:
   a full-deadline silence is strong evidence it won't speak Bitcoin, and retrying
   would burn another full `message_timeout` — up to `handshake_attempts ×
   message_timeout` of worker time on a single dead-but-listening host, a real
@@ -791,7 +826,9 @@ timeout `min(deadline − now, getaddr_idle)` and stops on the first idle timeou
 
 ### 6.3 Error handling
 
-- Connect exceptions ⇒ Unreachable.
+- Connect exceptions ⇒ retry like any other transient failure (Section 6.2);
+  exhausting attempts ⇒ Unreachable, or HandshakeFailed if an earlier attempt
+  had already connected successfully (Section 3.7).
 - Disconnect exceptions ⇒ logged, ignored.
 - Handshake receive errors/timeouts ⇒ attempt fails.
 - Getaddr send/receive errors ⇒ loop ends with what was collected.

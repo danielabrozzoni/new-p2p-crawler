@@ -251,7 +251,22 @@ impl Crawler {
                     key.render(),
                     kind.as_str()
                 );
-                self.finish(key, NodeState::Unreachable, Some(kind));
+                // Retry like any other transient failure (Section 6.2): a connect
+                // timeout/refusal can be self-inflicted (e.g. a saturated worker
+                // pool), not necessarily a dead peer. A node that connected on an
+                // earlier attempt (time_connect_ms is set) has already proven it's
+                // reachable, so exhausting attempts here means HandshakeFailed, not
+                // Unreachable — the earlier evidence must not be discarded.
+                let ever_connected = self
+                    .store
+                    .with_entry(key, |e| e.stats.time_connect_ms.is_some())
+                    .unwrap_or(false);
+                let terminal = if ever_connected {
+                    NodeState::HandshakeFailed
+                } else {
+                    NodeState::Unreachable
+                };
+                self.retry_or_finish(key, t, attempt < max_attempts, terminal, Some(kind));
                 return;
             }
         };
@@ -280,31 +295,66 @@ impl Crawler {
             }
             HandshakeResult::Timeout => {
                 // Full-deadline silence: do not retry unless configured (6.2).
-                if self.settings.retry_on_timeout && attempt < max_attempts {
-                    self.requeue(key, t);
-                } else {
-                    self.finish(key, NodeState::HandshakeFailed, Some(FailKind::HandshakeTimeout));
-                }
+                let should_retry = self.settings.retry_on_timeout && attempt < max_attempts;
+                self.retry_or_finish(
+                    key,
+                    t,
+                    should_retry,
+                    NodeState::HandshakeFailed,
+                    Some(FailKind::HandshakeTimeout),
+                );
             }
             HandshakeResult::Failed(kind) => {
                 // Mid-handshake transport/protocol error: retry if attempts
                 // remain (6.2), otherwise record the specific reason.
-                if attempt < max_attempts {
-                    self.requeue(key, t);
-                } else {
-                    self.finish(key, NodeState::HandshakeFailed, Some(kind));
-                }
+                self.retry_or_finish(
+                    key,
+                    t,
+                    attempt < max_attempts,
+                    NodeState::HandshakeFailed,
+                    Some(kind),
+                );
             }
         }
         // Disconnect happens by dropping `conn`.
     }
 
+    /// Retry-or-give-up decision shared by the connect and handshake failure paths
+    /// (Section 6.2): requeue if attempts remain, else finish with `terminal`.
+    /// `terminal`/`reason` are also used as the fallback if the queue turns out to
+    /// be closed (crawl ending mid-retry), so they must be the caller's correct
+    /// terminal state for *this* failure — passing the wrong one mislabels a node
+    /// that never reached this failure's stage.
+    fn retry_or_finish(
+        &self,
+        key: &AddrKey,
+        t: Transport,
+        should_retry: bool,
+        terminal: NodeState,
+        reason: Option<FailKind>,
+    ) {
+        if should_retry {
+            self.requeue(key, t, terminal, reason);
+        } else {
+            self.finish(key, terminal, reason);
+        }
+    }
+
     /// Lateral Processing → Queued move; does not change `outstanding` (3.5).
-    fn requeue(&self, key: &AddrKey, t: Transport) {
+    /// `on_channel_closed`/`reason` are the terminal state and failure reason to
+    /// record if the crawl ends before the retry can be re-sent (see
+    /// `retry_or_finish`).
+    fn requeue(
+        &self,
+        key: &AddrKey,
+        t: Transport,
+        on_channel_closed: NodeState,
+        reason: Option<FailKind>,
+    ) {
         self.store.with_entry(key, |e| e.state = NodeState::Queued);
         if self.queues.sender(t).try_send(key.clone()).is_err() {
             // Channel closed mid-crawl: treat as terminal to keep the counter sane.
-            self.finish(key, NodeState::HandshakeFailed, Some(FailKind::HandshakeOther));
+            self.finish(key, on_channel_closed, reason);
         }
     }
 
