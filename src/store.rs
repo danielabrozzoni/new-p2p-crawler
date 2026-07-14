@@ -36,6 +36,64 @@ pub enum NodeState {
     StaleDiscarded,
 }
 
+/// Why a node ended up in a failure state — the reason recorded alongside a
+/// terminal `Unreachable` / `HandshakeFailed`. Surfaced in the result CSVs and
+/// aggregated into a histogram in the stats JSON so a run's failures can be
+/// understood at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailKind {
+    // ---- Connect phase (terminal state = Unreachable) ----
+    /// TCP/proxy actively refused the connection (nothing listening).
+    ConnectRefused,
+    /// The connect (incl. SOCKS5/SAM setup) exceeded its timeout.
+    ConnectTimeout,
+    /// Network/host unreachable (no route).
+    ConnectUnreachable,
+    /// Connection reset during connect.
+    ConnectReset,
+    /// The Tor SOCKS5 proxy negotiation failed (e.g. proxy down, REP != 0).
+    ProxyError,
+    /// The I2P SAM session/stream setup failed.
+    SamError,
+    /// Any other connect-phase error.
+    ConnectOther,
+
+    // ---- Handshake phase (terminal state = HandshakeFailed) ----
+    /// Failed to write our `version` message.
+    VersionSendFailed,
+    /// Peer stayed silent for the whole handshake deadline.
+    HandshakeTimeout,
+    /// Peer closed / reset the connection mid-handshake (EOF).
+    ConnectionClosed,
+    /// Peer sent a `version` we could not parse.
+    MalformedVersion,
+    /// Stream desynchronised: bad network magic, checksum, or oversize payload.
+    ProtocolDesync,
+    /// Any other handshake-phase error.
+    HandshakeOther,
+}
+
+impl FailKind {
+    /// The snake_case identifier used in output CSVs and the stats histogram.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailKind::ConnectRefused => "connect_refused",
+            FailKind::ConnectTimeout => "connect_timeout",
+            FailKind::ConnectUnreachable => "connect_unreachable",
+            FailKind::ConnectReset => "connect_reset",
+            FailKind::ProxyError => "proxy_error",
+            FailKind::SamError => "sam_error",
+            FailKind::ConnectOther => "connect_other",
+            FailKind::VersionSendFailed => "version_send_failed",
+            FailKind::HandshakeTimeout => "handshake_timeout",
+            FailKind::ConnectionClosed => "connection_closed",
+            FailKind::MalformedVersion => "malformed_version",
+            FailKind::ProtocolDesync => "protocol_desync",
+            FailKind::HandshakeOther => "handshake_other",
+        }
+    }
+}
+
 /// Peer metadata retained from a successful handshake (Section 4.4).
 #[derive(Debug, Clone)]
 pub struct HandshakeData {
@@ -109,6 +167,8 @@ pub struct NodeEntry {
     pub state: NodeState,
     pub handshake: Option<HandshakeData>,
     pub stats: NodeStats,
+    /// Why this node failed, when in a terminal failure state (Section 7).
+    pub failure: Option<FailKind>,
 }
 
 impl NodeEntry {
@@ -119,6 +179,7 @@ impl NodeEntry {
             state,
             handshake: None,
             stats: NodeStats::default(),
+            failure: None,
         }
     }
 }

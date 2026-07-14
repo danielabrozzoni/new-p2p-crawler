@@ -26,6 +26,28 @@ cargo build --release
 ./target/release/new-p2p-crawler
 ```
 
+## Probe a specific node list
+
+The `probe` binary connects to an explicit list of nodes and reports the
+outcome of each connect + handshake **without crawling** — no DNS seeds, and it
+never follows `addr`/`addrv2` responses, so it touches exactly the nodes you
+give it. It reuses the crawler's transports, timeouts, retries, and result
+files. Handy for debugging *why* a handshake fails against known peers.
+
+```bash
+# Nodes as arguments (host, host:port, or [ipv6]:port; bare host uses --port).
+./target/release/probe 1.2.3.4:8333 '[2001:db8::1]:8333' abc…xyz.onion
+
+# Or from a file / stdin (one per line; # comments and blanks ignored).
+./target/release/probe --nodes-file nodes.txt
+cat nodes.txt | ./target/release/probe
+```
+
+It prints a per-node report (`REACHABLE` / `HANDSHAKE_FAILED` / `UNREACHABLE`
+with the failure reason) and a failure-reason histogram, and writes the same
+result files as the crawler. All shared flags (`--*-timeout`, `--*-concurrency`,
+`--tor-proxy-*`, `--i2p-sam-*`, `--result-path`, `--log-level`, …) apply.
+
 ## Requirements
 
 - Tor: a SOCKS5 proxy at `127.0.0.1:9050` (`--tor-proxy-host/-port`).
@@ -53,11 +75,32 @@ Each run writes into its own subdirectory of the result dir, named
 `<timestamp>_v<version>` (the time the run started), containing:
 
 - `reachable_nodes.csv` — connected + handshake completed, full metadata
-- `handshake_failed_nodes.csv` — connected but no `version`
-- `unreachable_nodes.csv` — never connected
-- `crawler_stats.json` — settings + crawl-wide counts and node lists
+- `handshake_failed_nodes.csv` — connected but handshake failed (has a `failure_reason` column)
+- `unreachable_nodes.csv` — never connected (has a `failure_reason` column)
+- `crawler_stats.json` — settings + crawl-wide counts and node lists, including
+  `handshake_failed_reasons` / `unreachable_reasons` histograms
 - `addr_responses.csv` — on by default; disable with `--no-record-addr-responses`
 - `debug_log.txt` — optional, on by default
+
+### Failure reasons
+
+Failed nodes carry a `failure_reason` (also aggregated in the stats JSON):
+
+| Phase | Reason | Meaning |
+|-------|--------|---------|
+| connect | `connect_refused` | nothing listening (RST) |
+| connect | `connect_timeout` | connect/proxy/SAM setup timed out |
+| connect | `connect_unreachable` | no route to host/network |
+| connect | `connect_reset` | connection reset during connect |
+| connect | `proxy_error` | Tor SOCKS5 negotiation failed (proxy down / REP ≠ 0) |
+| connect | `sam_error` | I2P SAM session/stream setup failed |
+| connect | `connect_other` | other connect-phase error |
+| handshake | `version_send_failed` | could not send our `version` |
+| handshake | `handshake_timeout` | peer stayed silent for the whole deadline |
+| handshake | `connection_closed` | peer closed/reset mid-handshake (EOF) |
+| handshake | `malformed_version` | peer's `version` did not parse |
+| handshake | `protocol_desync` | bad magic/checksum or oversize payload |
+| handshake | `handshake_other` | other handshake-phase error |
 
 The snapshot files (`reachable`/`handshake_failed`/`unreachable`/`crawler_stats`)
 are written when the crawl finishes, and also re-written every

@@ -8,7 +8,7 @@ use crate::protocol::{
     MAX_ADDR_TO_SEND,
 };
 use crate::settings::Settings;
-use crate::store::{AddrKey, FrontierOutcome, HandshakeData, NodeState, NodeStore};
+use crate::store::{AddrKey, FailKind, FrontierOutcome, HandshakeData, NodeState, NodeStore};
 use crate::transport::{
     connect_socks5, connect_tcp, Connection, SamSession,
 };
@@ -112,10 +112,14 @@ impl Crawler {
         self.enqueue(key);
     }
 
-    /// Move an address to a terminal state; close all queues if it was the last
-    /// outstanding work in the crawl (Section 3.5 `finish`).
-    fn finish(&self, key: &AddrKey, terminal: NodeState) {
-        self.store.with_entry(key, |e| e.state = terminal);
+    /// Move an address to a terminal state, recording the failure reason (if
+    /// any); close all queues if it was the last outstanding work in the crawl
+    /// (Section 3.5 `finish`).
+    fn finish(&self, key: &AddrKey, terminal: NodeState, reason: Option<FailKind>) {
+        self.store.with_entry(key, |e| {
+            e.state = terminal;
+            e.failure = reason;
+        });
         if self.store.decr_outstanding() == 1 {
             self.queues.close_all();
         }
@@ -241,8 +245,13 @@ impl Crawler {
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!("connect failed for {}: {e}", key.render());
-                self.finish(key, NodeState::Unreachable);
+                let kind = classify_connect_error(&e, network);
+                tracing::debug!(
+                    "connect failed for {} [{}]: {e}",
+                    key.render(),
+                    kind.as_str()
+                );
+                self.finish(key, NodeState::Unreachable, Some(kind));
                 return;
             }
         };
@@ -262,24 +271,28 @@ impl Crawler {
                 self.store.with_entry(key, |e| {
                     e.handshake = Some(hd.clone());
                 });
-                // 3.3 peer discovery.
-                self.getaddr(&mut conn, key, &timeouts, network, &hd).await;
-                self.finish(key, NodeState::Reachable);
+                // 3.3 peer discovery — skipped in direct-probe mode so the run
+                // never enqueues addresses beyond the seeded node list.
+                if !self.settings.probe_mode {
+                    self.getaddr(&mut conn, key, &timeouts, network, &hd).await;
+                }
+                self.finish(key, NodeState::Reachable, None);
             }
             HandshakeResult::Timeout => {
                 // Full-deadline silence: do not retry unless configured (6.2).
                 if self.settings.retry_on_timeout && attempt < max_attempts {
                     self.requeue(key, t);
                 } else {
-                    self.finish(key, NodeState::HandshakeFailed);
+                    self.finish(key, NodeState::HandshakeFailed, Some(FailKind::HandshakeTimeout));
                 }
             }
-            HandshakeResult::Transport => {
-                // Mid-handshake transport error: retry if attempts remain (6.2).
+            HandshakeResult::Failed(kind) => {
+                // Mid-handshake transport/protocol error: retry if attempts
+                // remain (6.2), otherwise record the specific reason.
                 if attempt < max_attempts {
                     self.requeue(key, t);
                 } else {
-                    self.finish(key, NodeState::HandshakeFailed);
+                    self.finish(key, NodeState::HandshakeFailed, Some(kind));
                 }
             }
         }
@@ -291,7 +304,7 @@ impl Crawler {
         self.store.with_entry(key, |e| e.state = NodeState::Queued);
         if self.queues.sender(t).try_send(key.clone()).is_err() {
             // Channel closed mid-crawl: treat as terminal to keep the counter sane.
-            self.finish(key, NodeState::HandshakeFailed);
+            self.finish(key, NodeState::HandshakeFailed, Some(FailKind::HandshakeOther));
         }
     }
 
@@ -372,7 +385,7 @@ impl Crawler {
         let nonce = rand::random::<u64>();
         let payload = build_version(sent_ts, nonce);
         if conn.send("version", &payload).await.is_err() {
-            return HandshakeResult::Transport;
+            return HandshakeResult::Failed(FailKind::VersionSendFailed);
         }
 
         // Wait for the peer's version (Section 3.2 step 3, 4.1 receive loop).
@@ -381,10 +394,12 @@ impl Crawler {
         let peer_version = match self.recv_matching(conn, &["version"], deadline, per).await {
             RecvResult::Message(env) => match parse_version(&env.payload) {
                 Some(v) => v,
-                None => return HandshakeResult::Transport, // malformed payload
+                None => return HandshakeResult::Failed(FailKind::MalformedVersion),
             },
             RecvResult::Timeout => return HandshakeResult::Timeout,
-            RecvResult::Transport => return HandshakeResult::Transport,
+            RecvResult::Transport(e) => {
+                return HandshakeResult::Failed(classify_handshake_error(&e))
+            }
         };
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -425,7 +440,7 @@ impl Crawler {
                     // Per-envelope timeout elapsed; loop re-checks the deadline.
                     continue;
                 }
-                Err(_) => return RecvResult::Transport,
+                Err(e) => return RecvResult::Transport(e),
             }
         }
     }
@@ -569,14 +584,55 @@ impl Crawler {
 enum HandshakeResult {
     /// Peer version parsed; carries (version, sent epoch, duration ms).
     Version(VersionData, i64, u64),
+    /// Peer stayed silent for the whole handshake deadline.
     Timeout,
-    Transport,
+    /// A specific transport/protocol failure (carries the classified reason).
+    Failed(FailKind),
 }
 
 enum RecvResult {
     Message(crate::transport::Envelope),
     Timeout,
-    Transport,
+    Transport(std::io::Error),
+}
+
+/// Classify a connect-phase `io::Error` into a [`FailKind`]. Uses the error
+/// kind first, falling back to the transport (proxy vs SAM vs direct) for
+/// otherwise-opaque errors so the reported reason still points at the right
+/// subsystem.
+fn classify_connect_error(e: &std::io::Error, network: NetworkType) -> FailKind {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::TimedOut => FailKind::ConnectTimeout,
+        ErrorKind::ConnectionRefused => FailKind::ConnectRefused,
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => FailKind::ConnectReset,
+        _ => {
+            // Linux ENETUNREACH (101) / EHOSTUNREACH (113): no route to host.
+            if matches!(e.raw_os_error(), Some(101) | Some(113)) {
+                return FailKind::ConnectUnreachable;
+            }
+            match network {
+                NetworkType::OnionV2 | NetworkType::OnionV3 => FailKind::ProxyError,
+                NetworkType::I2p => FailKind::SamError,
+                _ => FailKind::ConnectOther,
+            }
+        }
+    }
+}
+
+/// Classify a handshake-phase `io::Error` (from the framed receive loop) into a
+/// [`FailKind`].
+fn classify_handshake_error(e: &std::io::Error) -> FailKind {
+    use std::io::ErrorKind;
+    match e.kind() {
+        // read_envelope raises InvalidData on magic/checksum/oversize mismatch.
+        ErrorKind::InvalidData => FailKind::ProtocolDesync,
+        ErrorKind::UnexpectedEof
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe => FailKind::ConnectionClosed,
+        _ => FailKind::HandshakeOther,
+    }
 }
 
 /// Current UNIX epoch seconds.
@@ -585,4 +641,65 @@ pub fn now_epoch() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn connect_errors_classify_by_kind() {
+        let refused = Error::from(ErrorKind::ConnectionRefused);
+        assert_eq!(
+            classify_connect_error(&refused, NetworkType::Ipv4),
+            FailKind::ConnectRefused
+        );
+        let timeout = Error::new(ErrorKind::TimedOut, "tcp connect timed out");
+        assert_eq!(
+            classify_connect_error(&timeout, NetworkType::Ipv4),
+            FailKind::ConnectTimeout
+        );
+    }
+
+    #[test]
+    fn opaque_connect_errors_fall_back_to_transport() {
+        // SOCKS5/SAM failures surface as ErrorKind::Other; the transport decides.
+        let other = Error::other("socks5 connect failed: REP=0x05");
+        assert_eq!(
+            classify_connect_error(&other, NetworkType::OnionV3),
+            FailKind::ProxyError
+        );
+        assert_eq!(
+            classify_connect_error(&other, NetworkType::I2p),
+            FailKind::SamError
+        );
+        assert_eq!(
+            classify_connect_error(&other, NetworkType::Ipv6),
+            FailKind::ConnectOther
+        );
+    }
+
+    #[test]
+    fn unreachable_os_errors_are_detected() {
+        // ENETUNREACH / EHOSTUNREACH on Linux.
+        assert_eq!(
+            classify_connect_error(&Error::from_raw_os_error(101), NetworkType::Ipv4),
+            FailKind::ConnectUnreachable
+        );
+        assert_eq!(
+            classify_connect_error(&Error::from_raw_os_error(113), NetworkType::Ipv4),
+            FailKind::ConnectUnreachable
+        );
+    }
+
+    #[test]
+    fn handshake_errors_classify_by_kind() {
+        let desync = Error::new(ErrorKind::InvalidData, "network magic mismatch");
+        assert_eq!(classify_handshake_error(&desync), FailKind::ProtocolDesync);
+        let eof = Error::from(ErrorKind::UnexpectedEof);
+        assert_eq!(classify_handshake_error(&eof), FailKind::ConnectionClosed);
+        let other = Error::other("weird");
+        assert_eq!(classify_handshake_error(&other), FailKind::HandshakeOther);
+    }
 }

@@ -1,26 +1,15 @@
 //! Bitcoin mainnet P2P network crawler (see SPECIFICATION_v2.md).
 
-mod addrlog;
-mod address;
-mod crawler;
-mod dns;
-mod output;
-mod preflight;
-mod protocol;
-mod settings;
-mod store;
-mod transport;
-
-use crate::addrlog::AddrLog;
-use crate::address::classify;
-use crate::crawler::Crawler;
-use crate::output::SeedResult;
-use crate::settings::Settings;
-use crate::store::{AddrKey, NodeStore};
 use clap::Parser;
+use new_p2p_crawler::addrlog::AddrLog;
+use new_p2p_crawler::address::classify;
+use new_p2p_crawler::crawler::{self, Crawler};
+use new_p2p_crawler::output::SeedResult;
+use new_p2p_crawler::settings::{self, Settings};
+use new_p2p_crawler::store::{self, AddrKey, NodeStore};
+use new_p2p_crawler::{dns, logging, output, preflight};
 use std::process::ExitCode;
 use std::sync::Arc;
-use tracing_subscriber::prelude::*;
 
 /// Exit code used for a configuration error (Section 2.4 step 4).
 const EXIT_CONFIG_ERROR: u8 = 2;
@@ -45,7 +34,7 @@ fn main() -> ExitCode {
     }
 
     // Init logging (UTC timestamps; console at chosen level, optional debug file).
-    let _guard = init_logging(&settings);
+    let _guard = logging::init(&settings);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -53,49 +42,6 @@ fn main() -> ExitCode {
         .expect("failed to build tokio runtime");
 
     runtime.block_on(async_main(settings))
-}
-
-fn init_logging(settings: &Settings) -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    use tracing_subscriber::fmt;
-    use tracing_subscriber::fmt::time::UtcTime;
-    use tracing_subscriber::EnvFilter;
-
-    let console_filter = EnvFilter::try_new(settings.log_level.to_lowercase())
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-
-    let console_layer = fmt::layer()
-        .with_timer(UtcTime::rfc_3339())
-        .with_writer(std::io::stdout)
-        .with_filter(console_filter);
-
-    // Optional plain-text debug log file (Section 8.6).
-    let (file_layer, guard) = if settings.store_debug_log && !settings.dry_run {
-        let path = settings.output_path("debug_log.txt");
-        match std::fs::File::create(&path) {
-            Ok(file) => {
-                let (nb, guard) = tracing_appender::non_blocking(file);
-                let layer = fmt::layer()
-                    .with_ansi(false)
-                    .with_timer(UtcTime::rfc_3339())
-                    .with_writer(nb)
-                    .with_filter(EnvFilter::new("debug"));
-                (Some(layer), Some(guard))
-            }
-            Err(e) => {
-                eprintln!("warning: cannot create debug log: {e}");
-                (None, None)
-            }
-        }
-    } else {
-        (None, None)
-    };
-
-    tracing_subscriber::registry()
-        .with(console_layer)
-        .with(file_layer)
-        .init();
-
-    guard
 }
 
 async fn async_main(settings: Arc<Settings>) -> ExitCode {

@@ -4,6 +4,7 @@
 use crate::address::NetworkType;
 use crate::settings::Settings;
 use crate::store::{AddrKey, NetworkBreakdown, NodeEntry, NodeState, NodeStore};
+use std::collections::BTreeMap;
 use csv::{Terminator, WriterBuilder};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -145,6 +146,7 @@ fn write_handshake_failed(
         "host",
         "port",
         "network",
+        "failure_reason",
         "handshake_timestamp",
         "time_connect",
         "handshake_attempts",
@@ -156,6 +158,7 @@ fn write_handshake_failed(
             key.host.as_str(),
             &key.port.to_string(),
             e.network.as_str(),
+            e.failure.map(|f| f.as_str()).unwrap_or(""),
             &s.first_version_send_ts.map(|v| v.to_string()).unwrap_or_default(),
             &s.time_connect_ms.map(|v| v.to_string()).unwrap_or_default(),
             &s.handshake_attempts.to_string(),
@@ -183,12 +186,20 @@ fn write_unreachable(
 
     let path = out_path(settings, &settings.result_settings.unreachable_nodes);
     let mut w = csv_writer(&path)?;
-    w.write_record(["host", "port", "network", "handshake_attempts", "freshest_timestamp"])?;
+    w.write_record([
+        "host",
+        "port",
+        "network",
+        "failure_reason",
+        "handshake_attempts",
+        "freshest_timestamp",
+    ])?;
     for (key, e) in rows {
         w.write_record([
             key.host.as_str(),
             &key.port.to_string(),
             e.network.as_str(),
+            e.failure.map(|f| f.as_str()).unwrap_or(""),
             &e.stats.handshake_attempts.to_string(),
             &e.freshest_ts.to_string(),
         ])?;
@@ -241,6 +252,9 @@ fn write_stats_json(
     let mut list_reachable = Vec::new();
     let mut list_handshake_failed = Vec::new();
     let mut list_unreachable = Vec::new();
+    // Failure-reason histograms (Section 7): why nodes failed, at a glance.
+    let mut handshake_failed_reasons: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut unreachable_reasons: BTreeMap<&'static str, u64> = BTreeMap::new();
 
     for (key, e) in snapshot {
         match e.state {
@@ -251,10 +265,14 @@ fn write_stats_json(
             NodeState::HandshakeFailed => {
                 handshake_failed.add(e.network);
                 list_handshake_failed.push(key.render());
+                let reason = e.failure.map(|f| f.as_str()).unwrap_or("unknown");
+                *handshake_failed_reasons.entry(reason).or_insert(0) += 1;
             }
             NodeState::Unreachable => {
                 unreachable.add(e.network);
                 list_unreachable.push(key.render());
+                let reason = e.failure.map(|f| f.as_str()).unwrap_or("unknown");
+                *unreachable_reasons.entry(reason).or_insert(0) += 1;
             }
             _ => {}
         }
@@ -300,6 +318,14 @@ fn write_stats_json(
     root.insert(
         "num_unreachable".to_string(),
         serde_json::to_value(BreakdownJson::from(&unreachable))?,
+    );
+    root.insert(
+        "handshake_failed_reasons".to_string(),
+        serde_json::to_value(&handshake_failed_reasons)?,
+    );
+    root.insert(
+        "unreachable_reasons".to_string(),
+        serde_json::to_value(&unreachable_reasons)?,
     );
     root.insert("num_advertised".to_string(), Value::from(store.len()));
     root.insert("num_nodes_from_seed".to_string(), Value::Object(num_from_seed));
