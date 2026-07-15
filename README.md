@@ -90,6 +90,16 @@ data. The run directory contains:
 - `addr_responses.csv` — on by default; disable with `--no-record-addr-responses`
 - `debug_log.txt` — optional, on by default
 
+Every failed connect or handshake attempt is written immediately to
+`debug_log.txt` with the endpoint, attempt number, stable failure reason, retry
+decision, and (when available) the underlying I/O error. The snapshot failure
+CSVs retain the terminal reason and the complete attempt history, so failure
+diagnostics remain available even when debug logging is disabled.
+
+The concurrency flags are hard in-flight connection caps, not batch sizes. The
+default IP cap is 64 (down from the old 512); the crawler keeps those workers busy
+without opening more IP connections than the configured cap.
+
 ### Failure reasons
 
 Failed nodes carry a `failure_reason` (also aggregated in the stats JSON):

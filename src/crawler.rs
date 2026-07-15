@@ -179,6 +179,16 @@ impl Crawler {
 
         let mut workers = tokio::task::JoinSet::new();
 
+        tracing::info!(
+            ip = self.settings.concurrency.ip,
+            tor = self.settings.concurrency.tor,
+            i2p = self.settings.concurrency.i2p,
+            total = self.settings.concurrency.ip
+                + self.settings.concurrency.tor
+                + self.settings.concurrency.i2p,
+            "connection concurrency caps"
+        );
+
         // One pool of `concurrency[T]` workers per transport (Section 3.5).
         for (transport, count) in [
             (Transport::Ip, self.settings.concurrency.ip),
@@ -345,9 +355,13 @@ impl Crawler {
                 let kind = classify_connect_error(&e, network);
                 self.update_attempt(key, "connect_failed", Some(kind), None, None);
                 tracing::debug!(
-                    "connect failed for {} [{}]: {e}",
-                    key.render(),
-                    kind.as_str()
+                    endpoint = %key.render(),
+                    attempt,
+                    max_attempts,
+                    reason = kind.as_str(),
+                    will_retry = attempt < max_attempts,
+                    error = %e,
+                    "connect attempt failed"
                 );
                 // Retry like any other transient failure (Section 6.2): a connect
                 // timeout/refusal can be self-inflicted (e.g. a saturated worker
@@ -408,6 +422,15 @@ impl Crawler {
                 self.finish(key, NodeState::Reachable, None);
             }
             HandshakeResult::Timeout => {
+                let should_retry = self.settings.retry_on_timeout && attempt < max_attempts;
+                tracing::debug!(
+                    endpoint = %key.render(),
+                    attempt,
+                    max_attempts,
+                    reason = FailKind::HandshakeTimeout.as_str(),
+                    will_retry = should_retry,
+                    "handshake attempt failed: peer version was not received before the deadline"
+                );
                 self.update_attempt(
                     key,
                     "handshake_timeout",
@@ -416,7 +439,6 @@ impl Crawler {
                     None,
                 );
                 // Full-deadline silence: do not retry unless configured (6.2).
-                let should_retry = self.settings.retry_on_timeout && attempt < max_attempts;
                 self.retry_or_finish(
                     key,
                     t,
@@ -425,17 +447,21 @@ impl Crawler {
                     Some(FailKind::HandshakeTimeout),
                 );
             }
-            HandshakeResult::Failed(kind) => {
+            HandshakeResult::Failed { kind, detail } => {
+                let should_retry = attempt < max_attempts;
+                tracing::debug!(
+                    endpoint = %key.render(),
+                    attempt,
+                    max_attempts,
+                    reason = kind.as_str(),
+                    will_retry = should_retry,
+                    detail = %detail,
+                    "handshake attempt failed"
+                );
                 self.update_attempt(key, "handshake_failed", Some(kind), None, None);
                 // Mid-handshake transport/protocol error: retry if attempts
                 // remain (6.2), otherwise record the specific reason.
-                self.retry_or_finish(
-                    key,
-                    t,
-                    attempt < max_attempts,
-                    NodeState::HandshakeFailed,
-                    Some(kind),
-                );
+                self.retry_or_finish(key, t, should_retry, NodeState::HandshakeFailed, Some(kind));
             }
         }
         // Disconnect happens by dropping `conn`.
@@ -592,8 +618,11 @@ impl Crawler {
         // Send our version.
         let nonce = rand::random::<u64>();
         let payload = build_version(sent_ts, nonce);
-        if conn.send("version", &payload).await.is_err() {
-            return HandshakeResult::Failed(FailKind::VersionSendFailed);
+        if let Err(e) = conn.send("version", &payload).await {
+            return HandshakeResult::Failed {
+                kind: FailKind::VersionSendFailed,
+                detail: e.to_string(),
+            };
         }
         // Record only a version message that was successfully written.
         self.store.with_entry(key, |e| {
@@ -612,23 +641,37 @@ impl Crawler {
         {
             RecvResult::Message(env) => match parse_version(&env.payload) {
                 Some(v) => v,
-                None => return HandshakeResult::Failed(FailKind::MalformedVersion),
+                None => {
+                    return HandshakeResult::Failed {
+                        kind: FailKind::MalformedVersion,
+                        detail: "peer version payload could not be parsed".to_string(),
+                    }
+                }
             },
             RecvResult::Timeout => return HandshakeResult::Timeout,
             RecvResult::Transport(e) => {
-                return HandshakeResult::Failed(classify_handshake_error(&e))
+                return HandshakeResult::Failed {
+                    kind: classify_handshake_error(&e),
+                    detail: e.to_string(),
+                }
             }
         };
 
         // BIP155 negotiation must be between version and verack and only when
         // both sides support it.
-        if peer_version.version.min(crate::protocol::PROTOCOL_VERSION) >= 70016
-            && conn.send("sendaddrv2", &[]).await.is_err()
-        {
-            return HandshakeResult::Failed(FailKind::NegotiationSendFailed);
+        if peer_version.version.min(crate::protocol::PROTOCOL_VERSION) >= 70016 {
+            if let Err(e) = conn.send("sendaddrv2", &[]).await {
+                return HandshakeResult::Failed {
+                    kind: FailKind::NegotiationSendFailed,
+                    detail: e.to_string(),
+                };
+            }
         }
-        if conn.send("verack", &[]).await.is_err() {
-            return HandshakeResult::Failed(FailKind::VerackSendFailed);
+        if let Err(e) = conn.send("verack", &[]).await {
+            return HandshakeResult::Failed {
+                kind: FailKind::VerackSendFailed,
+                detail: e.to_string(),
+            };
         }
 
         match self
@@ -636,9 +679,18 @@ impl Crawler {
             .await
         {
             RecvResult::Message(_) => {}
-            RecvResult::Timeout => return HandshakeResult::Failed(FailKind::PeerVerackTimeout),
+            RecvResult::Timeout => {
+                return HandshakeResult::Failed {
+                    kind: FailKind::PeerVerackTimeout,
+                    detail: "peer verack was not received before the handshake deadline"
+                        .to_string(),
+                }
+            }
             RecvResult::Transport(e) => {
-                return HandshakeResult::Failed(classify_handshake_error(&e));
+                return HandshakeResult::Failed {
+                    kind: classify_handshake_error(&e),
+                    detail: e.to_string(),
+                };
             }
         }
 
@@ -919,7 +971,7 @@ enum HandshakeResult {
     /// Peer stayed silent for the whole handshake deadline.
     Timeout,
     /// A specific transport/protocol failure (carries the classified reason).
-    Failed(FailKind),
+    Failed { kind: FailKind, detail: String },
 }
 
 enum RecvResult {
