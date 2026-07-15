@@ -958,8 +958,18 @@ impl Crawler {
             let u = self.store.count_state(NodeState::Unreachable);
             let q = self.store.count_state(NodeState::Queued);
             let p = self.store.count_state(NodeState::Processing);
+            let completed = r + f + u;
+            let remaining = self.store.outstanding();
+            let elapsed = self.start_clock.elapsed();
+            let (rate, eta) = match progress_estimate(elapsed, completed, remaining) {
+                Some((nodes_per_second, duration)) => (
+                    format!("{nodes_per_second:.2}nodes/s"),
+                    format_eta(duration),
+                ),
+                None => ("calculating".to_string(), "calculating".to_string()),
+            };
             tracing::info!(
-                "[STATUS] Elapsed: {elapsed_h:.1}h  reachable={r} handshake_failed={f} unreachable={u} queued={q} processing={p}"
+                "[STATUS] Elapsed: {elapsed_h:.1}h  reachable={r} handshake_failed={f} unreachable={u} queued={q} processing={p} remaining={remaining} rate={rate} eta_current_frontier={eta}"
             );
         }
     }
@@ -978,6 +988,46 @@ enum RecvResult {
     Message(crate::transport::Envelope),
     Timeout,
     Transport(std::io::Error),
+}
+
+/// Average terminal-node throughput and the time needed to drain the work that
+/// is outstanding right now. The frontier can still grow as peers advertise
+/// addresses, so this is deliberately not presented as a fixed completion time.
+fn progress_estimate(
+    elapsed: Duration,
+    completed: usize,
+    remaining: usize,
+) -> Option<(f64, Duration)> {
+    if completed == 0 || elapsed.is_zero() {
+        return None;
+    }
+    let elapsed_seconds = elapsed.as_secs_f64();
+    let nodes_per_second = completed as f64 / elapsed_seconds;
+    let eta_seconds = (remaining as f64 / nodes_per_second).ceil();
+    if !nodes_per_second.is_finite() || nodes_per_second <= 0.0 || !eta_seconds.is_finite() {
+        return None;
+    }
+    Some((
+        nodes_per_second,
+        Duration::from_secs(eta_seconds.min(u64::MAX as f64) as u64),
+    ))
+}
+
+fn format_eta(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let days = total / 86_400;
+    let hours = (total % 86_400) / 3_600;
+    let minutes = (total % 3_600) / 60;
+    let seconds = total % 60;
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 /// Classify a connect-phase `io::Error` into a [`FailKind`]. Uses the error
@@ -1086,6 +1136,23 @@ mod tests {
         assert_eq!(classify_handshake_error(&eof), FailKind::ConnectionClosed);
         let other = Error::other("weird");
         assert_eq!(classify_handshake_error(&other), FailKind::HandshakeOther);
+    }
+
+    #[test]
+    fn progress_eta_uses_completed_rate_and_current_remaining_work() {
+        let (rate, eta) = progress_estimate(Duration::from_secs(50), 100, 40).unwrap();
+        assert_eq!(rate, 2.0);
+        assert_eq!(eta, Duration::from_secs(20));
+        assert!(progress_estimate(Duration::from_secs(50), 0, 40).is_none());
+        assert!(progress_estimate(Duration::ZERO, 100, 40).is_none());
+    }
+
+    #[test]
+    fn eta_is_formatted_for_humans() {
+        assert_eq!(format_eta(Duration::from_secs(42)), "42s");
+        assert_eq!(format_eta(Duration::from_secs(192)), "3m 12s");
+        assert_eq!(format_eta(Duration::from_secs(7_445)), "2h 4m 5s");
+        assert_eq!(format_eta(Duration::from_secs(93_720)), "1d 2h 2m");
     }
 
     #[test]

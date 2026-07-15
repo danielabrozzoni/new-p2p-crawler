@@ -100,6 +100,10 @@ The concurrency flags are hard in-flight connection caps, not batch sizes. The
 default IP cap is 64 (down from the old 512); the crawler keeps those workers busy
 without opening more IP connections than the configured cap.
 
+The five-second status log includes average completed-node throughput and an
+`eta_current_frontier` estimate based on the work currently queued or processing.
+The estimate can move upward when peers advertise new addresses.
+
 ### Failure reasons
 
 Failed nodes carry a `failure_reason` (also aggregated in the stats JSON):

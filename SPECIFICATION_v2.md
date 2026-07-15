@@ -502,12 +502,16 @@ One monitor task runs alongside the workers. It:
 - **Logs** each iteration a single `INFO` line:
 
   ```
-  [STATUS] Elapsed: <H.h>h  reachable=<R> handshake_failed=<F> unreachable=<U> queued=<P> processing=<X>
+  [STATUS] Elapsed: <H.h>h  reachable=<R> handshake_failed=<F> unreachable=<U> queued=<P> processing=<X> remaining=<N> rate=<V>nodes/s eta_current_frontier=<ETA>
   ```
 
   where `<H.h> = (now − start_clock)/3600`, and `<R>`/`<F>`/`<U>`/`<P>`/`<X>` are
   the counts of entries in states `Reachable`/`HandshakeFailed`/`Unreachable`/
-  `Queued`/`Processing`.
+  `Queued`/`Processing`. `<N>` is the exact outstanding-work counter. `<V>` is
+  average completed-node throughput (`(R + F + U) / elapsed`), and `<ETA>` is
+  `<N> / <V>` in a compact human-readable form. Until a rate can be calculated,
+  both fields say `calculating`. The ETA applies only to the current frontier:
+  newly discovered addresses can increase it during the crawl.
 - **Clock**: `start_clock` is set at **crawl launch** (Section 2.4 step 5).
   `runtime_seconds = int(now − start_clock)` is recorded once, at termination.
 - **Exit**: when the crawl terminates (Section 3.6), log
