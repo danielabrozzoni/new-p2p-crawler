@@ -276,13 +276,13 @@ After a successful handshake, the worker always solicits peers:
    then stays silent; the short idle timeout detects that quickly instead of
    blocking for the full message timeout.
 
-   **Early exit:** Bitcoin Core answers `getaddr` with a single snapshot of at most
-   **1000** addresses (`MAX_ADDR_TO_SEND`). A received `addr`/`addrv2` message
-   carrying **fewer than 1000** addresses therefore almost always means the dump is
-   complete, so the loop **ends on the first such sub-1000 message** instead of
-   paying the trailing `getaddr_idle` wait. A message carrying a full 1000 means
-   more may follow, so the loop keeps going under the idle/deadline bounds. This
-   removes the fixed `getaddr_idle` tax on the common case.
+   **Early exit:** Bitcoin Core answers `getaddr` with a snapshot of at most **1000**
+   addresses (`MAX_ADDR_TO_SEND`). A received `addr`/`addrv2` message carrying
+   **2–1000 addresses** is treated as the substantive reply, so the loop ends
+   without paying the trailing `getaddr_idle` wait. A singleton is commonly the
+   peer's self-announcement, not the requested dump, so the loop keeps listening
+   after zero or one address. Every wait remains bounded by
+   `min(deadline − now, getaddr_idle)`.
 3. **Update the freshest-seen timestamp** (Section 3.4.1) for every advertised
    address of an **enabled** network type (Section 9), before any dedup, to
    `max(existing, observed)`.

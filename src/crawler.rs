@@ -752,29 +752,19 @@ impl Crawler {
         }
         let start = Instant::now();
         let hard_deadline = start + Duration::from_secs(timeouts.getaddr);
-        let first_deadline = start + Duration::from_secs(timeouts.message.min(timeouts.getaddr));
         let idle = Duration::from_secs(timeouts.getaddr_idle);
-        let mut quiet_deadline: Option<Instant> = None;
         let mut valid_messages = 0u64;
 
         loop {
             let now = Instant::now();
-            let phase_deadline = quiet_deadline.unwrap_or(first_deadline);
-            let deadline = phase_deadline.min(hard_deadline);
-            if now >= deadline {
+            if now >= hard_deadline {
                 return if valid_messages == 0 {
-                    if deadline == hard_deadline {
-                        CollectionOutcome::HardTimeout
-                    } else {
-                        CollectionOutcome::NoResponseTimeout
-                    }
-                } else if deadline == hard_deadline {
-                    CollectionOutcome::PartialHardTimeout
+                    CollectionOutcome::HardTimeout
                 } else {
-                    CollectionOutcome::CompleteQuiet
+                    CollectionOutcome::PartialHardTimeout
                 };
             }
-            let wait = deadline - now;
+            let wait = (hard_deadline - now).min(idle);
             match conn.recv_one(wait).await {
                 Ok(Some(env)) => match env.command.as_str() {
                     "addr" | "addrv2" => {
@@ -818,6 +808,7 @@ impl Crawler {
                                 };
                             }
                         };
+                        let address_count = parsed.addrs.len();
                         if self
                             .handle_addr_message(key, &env.command, &parsed, hd)
                             .await
@@ -829,7 +820,9 @@ impl Crawler {
                         valid_messages += 1;
                         self.store
                             .with_entry(key, |entry| entry.stats.valid_addr_messages += 1);
-                        quiet_deadline = Some(Instant::now() + idle);
+                        if is_getaddr_reply_complete(address_count) {
+                            return CollectionOutcome::CompleteQuiet;
+                        }
                     }
                     "ping" if conn.answer_ping(&env.payload, hd.version).await.is_err() => {
                         return if valid_messages == 0 {
@@ -1069,6 +1062,14 @@ fn classify_handshake_error(e: &std::io::Error) -> FailKind {
     }
 }
 
+/// A one-address message is normally the peer's self-announcement, not the
+/// substantive getaddr reply. Keep listening after empty or singleton messages;
+/// any valid block containing at least two addresses completes the response.
+/// The parser separately enforces Bitcoin Core's 1000-address maximum.
+fn is_getaddr_reply_complete(address_count: usize) -> bool {
+    address_count > 1
+}
+
 /// Current UNIX epoch seconds.
 pub fn now_epoch() -> i64 {
     std::time::SystemTime::now()
@@ -1136,6 +1137,17 @@ mod tests {
         assert_eq!(classify_handshake_error(&eof), FailKind::ConnectionClosed);
         let other = Error::other("weird");
         assert_eq!(classify_handshake_error(&other), FailKind::HandshakeOther);
+    }
+
+    #[test]
+    fn getaddr_reply_completion_ignores_self_announcements() {
+        assert!(!is_getaddr_reply_complete(0));
+        assert!(!is_getaddr_reply_complete(1));
+        assert!(is_getaddr_reply_complete(2));
+        assert!(is_getaddr_reply_complete(
+            crate::protocol::MAX_ADDR_TO_SEND - 1
+        ));
+        assert!(is_getaddr_reply_complete(crate::protocol::MAX_ADDR_TO_SEND));
     }
 
     #[test]
