@@ -20,6 +20,7 @@ pub struct Settings {
     pub version_info: VersionInfo,
     pub delay_start: u64,
     pub max_nodes: Option<usize>,
+    pub max_addresses: usize,
     pub enabled_networks: EnabledNetworks,
     pub strict_networks: bool,
     pub freshness_threshold: i64,
@@ -149,7 +150,10 @@ impl Settings {
 
 /// Raw CLI definition (Section 9). Env-var fallbacks handled by clap.
 #[derive(Parser, Debug)]
-#[command(name = "new-p2p-crawler", about = "Bitcoin mainnet P2P network crawler")]
+#[command(
+    name = "new-p2p-crawler",
+    about = "Bitcoin mainnet P2P network crawler"
+)]
 pub struct Cli {
     #[command(flatten)]
     pub common: CommonArgs,
@@ -160,6 +164,14 @@ pub struct Cli {
     /// Stop after processing at most N nodes (testing cap; default unlimited)
     #[arg(long, value_name = "N", help_heading = "Crawl behavior")]
     max_nodes: Option<usize>,
+    /// Maximum unique addresses retained across queues and the frontier
+    #[arg(
+        long,
+        default_value_t = 1_000_000,
+        value_name = "N",
+        help_heading = "Crawl behavior"
+    )]
+    max_addresses: usize,
     /// Skip addresses last-seen older than this; seconds or 2d/48h; 0 disables
     #[arg(long, default_value = "2d", help_heading = "Crawl behavior")]
     freshness_threshold: String,
@@ -228,7 +240,7 @@ pub struct CommonArgs {
 
     // ---- Concurrency ----
     /// Concurrent IPv4/IPv6/CJDNS workers
-    #[arg(long, default_value_t = 512, help_heading = "Concurrency")]
+    #[arg(long, default_value_t = 64, help_heading = "Concurrency")]
     ip_concurrency: usize,
     /// Concurrent Tor workers
     #[arg(long, default_value_t = 64, help_heading = "Concurrency")]
@@ -337,8 +349,13 @@ impl Cli {
         } else {
             parse_duration(&self.freshness_threshold)?
         };
-        self.common
-            .into_settings(freshness_threshold, self.max_nodes, self.dry_run, false)
+        self.common.into_settings(
+            freshness_threshold,
+            self.max_nodes,
+            self.max_addresses,
+            self.dry_run,
+            false,
+        )
     }
 }
 
@@ -351,11 +368,14 @@ impl CommonArgs {
         self,
         freshness_threshold: i64,
         max_nodes: Option<usize>,
+        max_addresses: usize,
         dry_run: bool,
         probe_mode: bool,
     ) -> anyhow::Result<Settings> {
         let timestamp = self.timestamp.unwrap_or_else(|| {
-            chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string()
+            chrono::Utc::now()
+                .format("%Y-%m-%dT%H-%M-%S%.9fZ")
+                .to_string()
         });
 
         let record_addr_responses = self.record_addr_responses && !self.no_record_addr_responses;
@@ -372,6 +392,46 @@ impl CommonArgs {
             cjdns: self.cjdns || !self.no_cjdns,
         };
 
+        anyhow::ensure!(
+            max_addresses > 0,
+            "--max-addresses must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.handshake_attempts > 0,
+            "--handshake-attempts must be greater than zero"
+        );
+        const MAX_CONCURRENCY: usize = 4096;
+        anyhow::ensure!(
+            self.ip_concurrency <= MAX_CONCURRENCY,
+            "--ip-concurrency exceeds {MAX_CONCURRENCY}"
+        );
+        anyhow::ensure!(
+            self.tor_concurrency <= MAX_CONCURRENCY,
+            "--tor-concurrency exceeds {MAX_CONCURRENCY}"
+        );
+        anyhow::ensure!(
+            self.i2p_concurrency <= MAX_CONCURRENCY,
+            "--i2p-concurrency exceeds {MAX_CONCURRENCY}"
+        );
+        if enabled_networks.ipv4 || enabled_networks.ipv6 || enabled_networks.cjdns {
+            anyhow::ensure!(
+                self.ip_concurrency > 0,
+                "enabled IP/CJDNS networks require --ip-concurrency > 0"
+            );
+        }
+        if enabled_networks.tor {
+            anyhow::ensure!(
+                self.tor_concurrency > 0,
+                "enabled Tor requires --tor-concurrency > 0"
+            );
+        }
+        if enabled_networks.i2p {
+            anyhow::ensure!(
+                self.i2p_concurrency > 0,
+                "enabled I2P requires --i2p-concurrency > 0"
+            );
+        }
+
         Ok(Settings {
             version_info: VersionInfo {
                 version: PKG_VERSION.to_string(),
@@ -379,6 +439,7 @@ impl CommonArgs {
             },
             delay_start: self.delay_start,
             max_nodes,
+            max_addresses,
             enabled_networks,
             strict_networks: self.strict_networks,
             freshness_threshold,
@@ -476,5 +537,31 @@ mod tests {
         assert_eq!(parse_duration("48h").unwrap(), 172800);
         assert_eq!(parse_duration("0").unwrap(), 0);
         assert!(parse_duration("2x").is_err());
+    }
+
+    #[test]
+    fn default_ip_concurrency_is_conservative() {
+        let cli = Cli::try_parse_from(["crawler"]).unwrap();
+        assert_eq!(cli.into_settings().unwrap().concurrency.ip, 64);
+    }
+
+    #[test]
+    fn zero_concurrency_is_rejected_for_enabled_transport() {
+        let cli = Cli::try_parse_from(["crawler", "--ip-concurrency", "0"]).unwrap();
+        assert!(cli.into_settings().is_err());
+    }
+
+    #[test]
+    fn zero_concurrency_is_allowed_for_disabled_transport() {
+        let cli = Cli::try_parse_from([
+            "crawler",
+            "--ip-concurrency",
+            "0",
+            "--no-ipv4",
+            "--no-ipv6",
+            "--no-cjdns",
+        ])
+        .unwrap();
+        assert!(cli.into_settings().is_ok());
     }
 }

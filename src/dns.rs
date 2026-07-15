@@ -6,7 +6,6 @@ use tokio::net::lookup_host;
 
 /// The hardcoded mainnet DNS seeds (Section 3.1), trailing-dot FQDN form.
 pub const SEEDS: &[&str] = &[
-    "seed.bitcoin.sipa.be.",
     "dnsseed.bluematt.me.",
     "seed.bitcoin.jonasschnelli.ch.",
     "seed.btc.petertodd.net.",

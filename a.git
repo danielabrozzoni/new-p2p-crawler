@@ -1,0 +1,174 @@
+commit 320a7dad29c25a5e1c8fbfb39858f7573a25aa29
+Author: Daniela Brozzoni <danielabrozzoni@protonmail.com>
+Date:   Tue Jul 14 08:28:14 2026 +0000
+
+    Retry connect failures and lower default IP concurrency
+    
+    A connect timeout/refusal isn't reliable evidence of a dead peer -- it
+    can be self-inflicted by a saturated worker pool, so treat it like any
+    other transient failure and retry up to handshake_attempts before
+    giving up as Unreachable. Also drop the default ip-concurrency from
+    512 to 64 to reduce that self-inflicted saturation.
+
+diff --git a/README.md b/README.md
+index 3233bd5..6008c63 100644
+--- a/README.md
++++ b/README.md
+@@ -41,7 +41,7 @@ cargo build --release
+ | `--no-<net>` | — | disable a network (`ipv4`/`ipv6`/`tor`/`i2p`/`cjdns`) |
+ | `--freshness-threshold` | `2d` | skip addrs last-seen older than this (`0` = off) |
+ | `--no-record-addr-responses` | on | stop logging every `addr`/`addrv2` reply (recording is on by default) |
+-| `--ip/-tor/-i2p-concurrency` | 512/64/32 | workers per transport |
++| `--ip/-tor/-i2p-concurrency` | 64/64/32 | workers per transport |
+ | `--result-path` | `results` | output directory |
+ | `--checkpoint-interval` | `10m` | re-write result files this often (`0` = off) |
+ 
+diff --git a/SPECIFICATION_v2.md b/SPECIFICATION_v2.md
+index 685cb2f..d8d6bf8 100644
+--- a/SPECIFICATION_v2.md
++++ b/SPECIFICATION_v2.md
+@@ -120,7 +120,7 @@ truth.
+                           ▼
+    [ per-transport worker pools, each draining its own transport's work queue ]
+                           │
+-             connect ─────┤── fail ──> state=Unreachable
++             connect ─────┤── fail ──> retry (re-Queue) or give up ──> state=Unreachable
+                           │
+            handshake ─────┤── fail ──> retry (re-Queue) or give up ──> state=HandshakeFailed
+                           │ success
+@@ -238,7 +238,9 @@ Each seed observation also updates the store's `freshest_ts` for that address to
+ For each node pulled from the queue, a worker:
+ 
+ 1. **Connects** using the transport for the address type (Section 4.2) with the
+-   per-network connect timeout. Connection failure ⇒ **Unreachable**.
++   per-network connect timeout. Connection failure retries like any other
++   transient failure (Section 6.2); exhausting `handshake_attempts` ⇒
++   **Unreachable**.
+ 2. **Sends `version`**, recording the send timestamp and incrementing the
+    handshake-attempt counter.
+ 3. **Waits for the peer's `version`** via the receive loop (Section 4.1) with
+@@ -466,14 +468,15 @@ Every processed node reaches exactly one terminal state:
+   provenance, and connect timing are known — no `version`-derived fields, and no
+   `getaddr` was ever sent. Semantically this means "something accepts TCP on this
+   host:port," not necessarily a Bitcoin node.
+-- **Unreachable**: the connection could not be established at all. Only address,
+-  provenance, and attempt count are known.
++- **Unreachable**: the connection could not be established after exhausting all
++  attempts. Only address, provenance, and attempt count are known.
+ 
+ Related transitions:
+ 
+-- **Retry**: a connectable node whose handshake failed but which still has attempts
+-  left is re-enqueued (`state = Queued`) rather than terminated; only after the
+-  last attempt does it become `HandshakeFailed`.
++- **Retry**: a node whose connect or handshake attempt failed but which still has
++  attempts left is re-enqueued (`state = Queued`) rather than terminated; only
++  after the last attempt does it become `Unreachable` (connect) or
++  `HandshakeFailed` (handshake).
+ - **Stale**: when the freshness filter is enabled, an advertised address older than
+   the threshold is set `StaleDiscarded` and not enqueued (reconsidered on later,
+   fresher advertisements). When disabled, nothing is stale.
+@@ -741,8 +744,9 @@ retains (version permitting):
+   transport family (`ip`, `tor`, `i2p`; CJDNS rides the `ip` TCP path) has its own
+   work queue drained by a pool of exactly `concurrency[T]` workers (Section 3.5), so
+   the pool size *is* the concurrency cap and no separate semaphore is needed.
+-  Suggested defaults: `ip` = 512, `tor` = 64, `i2p` = 32 (tune to host + side-service
+-  capacity).
++  Suggested defaults: `ip` = 64, `tor` = 64, `i2p` = 32 (tune to host + side-service
++  capacity — too high an `ip` concurrency can saturate the host's own outbound
++  connection path and cause live peers to blow past the connect timeout).
+ - **No per-host or global socket cap beyond the pool sizes; no explicit rate
+   limiting.** Pacing comes from timeouts + pool sizes.
+ - **Shared I2P SAM session**: one session id created on first I2P use, reused by
+@@ -772,26 +776,34 @@ timeout `min(deadline − now, getaddr_idle)` and stops on the first idle timeou
+ ### 6.2 Retries
+ 
+ - **Handshake attempts**: default 3 total (not 3 on top of an initial try). A
+-  per-node counter starts at 0 and is incremented **before** each `version` send.
++  per-node counter starts at 0 and is incremented **before** each connect attempt
++  (so it covers both the connect and the handshake stage of a processing round).
+   After a failure, retry iff `counter < handshake_attempts` (true at 1 and 2, false
+-  at 3). Sequence: attempt 1 fails → retry, 2 fails → retry, 3 fails → give up
+-  (`HandshakeFailed`). No backoff; the retry simply competes for selection later
+-  (re-enqueued).
+-- **Retry only transient failures** (default). A host that **connects but then stays
+-  silent for the whole handshake deadline** (Section 3.2 step 3) is *not* retried:
+-  a full-deadline silence is strong evidence it won't speak Bitcoin, and retrying
+-  would burn another full `message_timeout` — up to `handshake_attempts ×
+-  message_timeout` of worker time on a single dead-but-listening host, a real
+-  crawl-wide cost since the open internet is full of TCP services that aren't nodes.
+-  Such an attempt goes **straight to `HandshakeFailed`**. Retries are reserved for
+-  **mid-handshake transport errors** (connection reset/dropped after some bytes, or
+-  a magic/checksum desync, Section 4.1) that plausibly differ on a second try. A
++  at 3). Sequence: attempt 1 fails → retry, 2 fails → retry, 3 fails → give up. No
++  backoff; the retry simply competes for selection later (re-enqueued).
++- **Connect failures retry** like any other transient failure, up to
++  `handshake_attempts`, then give up as `Unreachable`. A connect timeout/refusal
++  is not reliable evidence of a dead peer — it can be self-inflicted (e.g. a
++  saturated worker pool causing legitimately-live peers to blow past the connect
++  timeout), so a single failed attempt does not condemn the address. This applies
++  uniformly to IP (TCP), Tor (SOCKS5), and I2P (SAM) connects.
++- **Retry only transient failures past the connect stage** (default). A host that
++  **connects but then stays silent for the whole handshake deadline** (Section 3.2
++  step 3) is *not* retried: a full-deadline silence is strong evidence it won't
++  speak Bitcoin, and retrying would burn another full `message_timeout` — up to
++  `handshake_attempts × message_timeout` of worker time on a single
++  dead-but-listening host, a real crawl-wide cost since the open internet is full
++  of TCP services that aren't nodes. Such an attempt goes **straight to
++  `HandshakeFailed`**. Post-connect retries are reserved for **mid-handshake
++  transport errors** (connection reset/dropped after some bytes, or a
++  magic/checksum desync, Section 4.1) that plausibly differ on a second try. A
+   flag/env can restore retry-on-timeout for networks where slow-but-live peers are
+   expected.
+ 
+ ### 6.3 Error handling
+ 
+-- Connect exceptions ⇒ Unreachable.
++- Connect exceptions ⇒ retry like any other transient failure (Section 6.2);
++  exhausting attempts ⇒ Unreachable.
+ - Disconnect exceptions ⇒ logged, ignored.
+ - Handshake receive errors/timeouts ⇒ attempt fails.
+ - Getaddr send/receive errors ⇒ loop ends with what was collected.
+@@ -1008,7 +1020,7 @@ CLI flags, most with a matching env var default.
+ `connect`/`message`/`getaddr`/`getaddr-idle`): `--<net>-<op>-timeout`, env
+ `<NET>_<OP>_TIMEOUT`. Defaults in Section 6.1.
+ 
+-**Concurrency**: `--ip-concurrency` (default 512), `--tor-concurrency` (64),
++**Concurrency**: `--ip-concurrency` (default 64), `--tor-concurrency` (64),
+ `--i2p-concurrency` (32).
+ 
+ **Crawler behavior**:
+diff --git a/src/crawler.rs b/src/crawler.rs
+index 538c02d..1420554 100644
+--- a/src/crawler.rs
++++ b/src/crawler.rs
+@@ -242,7 +242,14 @@ impl Crawler {
+             Ok(c) => c,
+             Err(e) => {
+                 tracing::debug!("connect failed for {}: {e}", key.render());
+-                self.finish(key, NodeState::Unreachable);
++                // Retry like any other transient failure (Section 6.2): a connect
++                // timeout/refusal can be self-inflicted (e.g. a saturated worker
++                // pool), not necessarily a dead peer.
++                if attempt < max_attempts {
++                    self.requeue(key, t);
++                } else {
++                    self.finish(key, NodeState::Unreachable);
++                }
+                 return;
+             }
+         };
+diff --git a/src/settings.rs b/src/settings.rs
+index ecb0191..4daf420 100644
+--- a/src/settings.rs
++++ b/src/settings.rs
+@@ -201,7 +201,7 @@ pub struct Cli {
+ 
+     // ---- Concurrency ----
+     /// Concurrent IPv4/IPv6/CJDNS workers
+-    #[arg(long, default_value_t = 512, help_heading = "Concurrency")]
++    #[arg(long, default_value_t = 64, help_heading = "Concurrency")]
+     ip_concurrency: usize,
+     /// Concurrent Tor workers
+     #[arg(long, default_value_t = 64, help_heading = "Concurrency")]
+

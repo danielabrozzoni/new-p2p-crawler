@@ -59,11 +59,12 @@ result files as the crawler. All shared flags (`--*-timeout`, `--*-concurrency`,
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--max-nodes N` | unlimited | stop after ~N processed nodes (testing cap) |
+| `--max-nodes N` | unlimited | strict cap on distinct nodes started (testing cap) |
+| `--max-addresses N` | `1000000` | cap unique retained frontier addresses and bound queue memory |
 | `--no-<net>` | — | disable a network (`ipv4`/`ipv6`/`tor`/`i2p`/`cjdns`) |
 | `--freshness-threshold` | `2d` | skip addrs last-seen older than this (`0` = off) |
 | `--no-record-addr-responses` | on | stop logging every `addr`/`addrv2` reply (recording is on by default) |
-| `--ip/-tor/-i2p-concurrency` | 512/64/32 | workers per transport |
+| `--ip/-tor/-i2p-concurrency` | 64/64/32 | workers per transport |
 | `--result-path` | `results` | output directory |
 | `--checkpoint-interval` | `10m` | re-write result files this often (`0` = off) |
 
@@ -71,14 +72,21 @@ Run `--help` for the full, sectioned list.
 
 ## Output
 
-Each run writes into its own subdirectory of the result dir, named
-`<timestamp>_v<version>` (the time the run started), containing:
+Each run creates a new, collision-resistant subdirectory of the result dir. An
+explicit `--timestamp` that would reuse an existing run fails instead of mixing
+data. The run directory contains:
 
-- `reachable_nodes.csv` — connected + handshake completed, full metadata
-- `handshake_failed_nodes.csv` — connected but handshake failed (has a `failure_reason` column)
-- `unreachable_nodes.csv` — never connected (has a `failure_reason` column)
-- `crawler_stats.json` — settings + crawl-wide counts and node lists, including
-  `handshake_failed_reasons` / `unreachable_reasons` histograms
+- `snapshot_manifest.json` — the atomically published current generation,
+  consistency/completeness labels, file hashes, and durable addr-log watermark
+- `snapshots/<generation>/reachable_nodes.csv` — connected + peer-`verack`
+  handshake completed, including socket/version provenance, collection outcome,
+  and attempt history
+- `snapshots/<generation>/handshake_failed_nodes.csv` — connected but handshake
+  failed (including all retry attempts)
+- `snapshots/<generation>/unreachable_nodes.csv` — never connected (including all
+  retry attempts)
+- `snapshots/<generation>/crawler_stats.json` — settings, snapshot-consistent
+  counts, completeness, and node lists
 - `addr_responses.csv` — on by default; disable with `--no-record-addr-responses`
 - `debug_log.txt` — optional, on by default
 
@@ -96,15 +104,21 @@ Failed nodes carry a `failure_reason` (also aggregated in the stats JSON):
 | connect | `sam_error` | I2P SAM session/stream setup failed |
 | connect | `connect_other` | other connect-phase error |
 | handshake | `version_send_failed` | could not send our `version` |
+| handshake | `negotiation_send_failed` | could not send `sendaddrv2` |
+| handshake | `verack_send_failed` | could not send our `verack` |
+| handshake | `peer_verack_timeout` | peer did not complete the handshake with `verack` |
 | handshake | `handshake_timeout` | peer stayed silent for the whole deadline |
 | handshake | `connection_closed` | peer closed/reset mid-handshake (EOF) |
 | handshake | `malformed_version` | peer's `version` did not parse |
 | handshake | `protocol_desync` | bad magic/checksum or oversize payload |
 | handshake | `handshake_other` | other handshake-phase error |
 
-The snapshot files (`reachable`/`handshake_failed`/`unreachable`/`crawler_stats`)
-are written when the crawl finishes, and also re-written every
-`--checkpoint-interval` while it runs, so a crash or hard kill still leaves recent
-output. Pressing **Ctrl+C** starts a graceful shutdown: in-flight nodes are
+Snapshot generations are published when the crawl finishes and every
+`--checkpoint-interval` while it runs. Checkpoints are explicitly labeled fuzzy;
+the post-worker generation is labeled final. Every category is present even when it
+contains only a header. `addr_responses.csv` uses monotonic event ids, records parser
+and request outcomes, and is flushed and synced before a manifest advances its
+durable watermark. A `getaddr` result is a capped, partial, potentially cached sample,
+not a complete live addrman view. Pressing **Ctrl+C** starts a graceful shutdown: in-flight nodes are
 allowed to finish, then the final output is written. A **second Ctrl+C**
 force-quits immediately without writing.

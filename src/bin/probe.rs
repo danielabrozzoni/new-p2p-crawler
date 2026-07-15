@@ -15,6 +15,7 @@
 use clap::Parser;
 use new_p2p_crawler::address::{classify, NetworkType};
 use new_p2p_crawler::crawler::{now_epoch, Crawler};
+use new_p2p_crawler::output::SnapshotMeta;
 use new_p2p_crawler::settings::{CommonArgs, Settings};
 use new_p2p_crawler::store::{AddrKey, NodeEntry, NodeState, NodeStore};
 use new_p2p_crawler::{logging, output};
@@ -64,7 +65,7 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_CONFIG_ERROR);
     }
 
-    let settings = match cli.common.into_settings(0, None, false, true) {
+    let settings = match cli.common.into_settings(0, None, 1_000_000, false, true) {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("configuration error: {e}");
@@ -86,7 +87,9 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_CONFIG_ERROR);
     }
 
-    if let Err(e) = std::fs::create_dir_all(settings.run_dir()) {
+    let create = std::fs::create_dir_all(&settings.result_settings.path)
+        .and_then(|_| std::fs::create_dir(settings.run_dir()));
+    if let Err(e) = create {
         eprintln!(
             "cannot create results directory {}: {e}",
             settings.run_dir().display()
@@ -111,9 +114,13 @@ async fn async_main(settings: Arc<Settings>, targets: Vec<AddrKey>) -> ExitCode 
         tokio::time::sleep(std::time::Duration::from_secs(settings.delay_start)).await;
     }
 
-    let store = Arc::new(NodeStore::new());
+    let store = Arc::new(NodeStore::with_limit(settings.max_addresses));
     // No addr-response log: probe mode never issues getaddr.
-    let crawler = Arc::new(Crawler::new(Arc::clone(&store), Arc::clone(&settings), None));
+    let crawler = Arc::new(Crawler::new(
+        Arc::clone(&store),
+        Arc::clone(&settings),
+        None,
+    ));
 
     // Seed exactly the provided nodes (dedup handled by the store).
     let now = now_epoch();
@@ -126,7 +133,7 @@ async fn async_main(settings: Arc<Settings>, targets: Vec<AddrKey>) -> ExitCode 
     }
     tracing::info!("probing {seeded} node(s)");
 
-    Arc::clone(&crawler).run().await;
+    let crawl_result = Arc::clone(&crawler).run().await;
 
     let runtime_seconds = crawler.start_clock.elapsed().as_secs() as i64;
     let num_processed = crawler.num_processed();
@@ -139,7 +146,18 @@ async fn async_main(settings: Arc<Settings>, targets: Vec<AddrKey>) -> ExitCode 
     );
 
     // Reuse the crawler's result files (no seeds → empty per-seed section).
-    if let Err(e) = output::write_all(&store, &settings, &[], runtime_seconds, num_processed) {
+    if let Err(e) = output::write_all(
+        &store,
+        &settings,
+        &[],
+        SnapshotMeta {
+            runtime_seconds,
+            num_processed,
+            durable_addr_event_id: None,
+            consistent: true,
+            run_complete: crawl_result.is_ok() && !crawler.terminated_early(),
+        },
+    ) {
         tracing::error!("failed to write output: {e}");
         return ExitCode::FAILURE;
     }
@@ -147,7 +165,12 @@ async fn async_main(settings: Arc<Settings>, targets: Vec<AddrKey>) -> ExitCode 
     print_report(&store);
     tracing::info!("result files written to {}", settings.run_dir().display());
 
-    ExitCode::SUCCESS
+    if let Err(e) = crawl_result {
+        tracing::error!("probe failed: {e}");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// Gather the raw node strings from args, `--nodes-file`, and — only if neither

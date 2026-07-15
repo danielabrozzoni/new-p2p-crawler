@@ -3,6 +3,9 @@
 use std::fmt;
 use std::net::Ipv6Addr;
 
+use data_encoding::BASE32_NOPAD;
+use sha3::{Digest, Sha3_256};
+
 /// The network type an address is classified into (Section 2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NetworkType {
@@ -71,15 +74,17 @@ pub fn classify(host: &str) -> NetworkType {
     }
 
     if let Some(label) = host.strip_suffix(".onion") {
-        return match label.len() {
-            16 => NetworkType::OnionV2,
-            56 => NetworkType::OnionV3,
-            _ => NetworkType::Unknown,
-        };
+        if label.len() == 16 && decode_base32(label, 10).is_some() {
+            return NetworkType::OnionV2;
+        }
+        if label.len() == 56 && valid_onion_v3(label) {
+            return NetworkType::OnionV3;
+        }
+        return NetworkType::Unknown;
     }
 
     if let Some(label) = host.strip_suffix(".b32.i2p") {
-        return if label.len() == 52 {
+        return if label.len() == 52 && decode_base32(label, 32).is_some() {
             NetworkType::I2p
         } else {
             NetworkType::Unknown
@@ -92,6 +97,35 @@ pub fn classify(host: &str) -> NetworkType {
     }
 
     NetworkType::Unknown
+}
+
+fn decode_base32(label: &str, expected_len: usize) -> Option<Vec<u8>> {
+    if label
+        .bytes()
+        .any(|b| !matches!(b, b'a'..=b'z' | b'2'..=b'7'))
+    {
+        return None;
+    }
+    let upper = label.to_ascii_uppercase();
+    BASE32_NOPAD
+        .decode(upper.as_bytes())
+        .ok()
+        .filter(|bytes| bytes.len() == expected_len)
+}
+
+fn valid_onion_v3(label: &str) -> bool {
+    let Some(decoded) = decode_base32(label, 35) else {
+        return false;
+    };
+    if decoded[34] != 3 {
+        return false;
+    }
+    let mut hasher = Sha3_256::new();
+    hasher.update(b".onion checksum");
+    hasher.update(&decoded[..32]);
+    hasher.update([3]);
+    let digest = hasher.finalize();
+    decoded[32..34] == digest[..2]
 }
 
 fn is_ipv4_dotted(host: &str) -> bool {
@@ -138,12 +172,20 @@ mod tests {
 
     #[test]
     fn classifies_onion_and_i2p() {
-        let v3 = format!("{}.onion", "a".repeat(56));
-        assert_eq!(classify(&v3), NetworkType::OnionV3);
+        let invalid_v3 = format!("{}.onion", "a".repeat(56));
+        assert_eq!(classify(&invalid_v3), NetworkType::Unknown);
         let v2 = format!("{}.onion", "a".repeat(16));
         assert_eq!(classify(&v2), NetworkType::OnionV2);
         let i2p = format!("{}.b32.i2p", "a".repeat(52));
         assert_eq!(classify(&i2p), NetworkType::I2p);
+        assert_eq!(
+            classify(&format!("{}.onion", "0".repeat(16))),
+            NetworkType::Unknown
+        );
+        assert_eq!(
+            classify(&format!("{}.b32.i2p", "!".repeat(52))),
+            NetworkType::Unknown
+        );
     }
 
     #[test]

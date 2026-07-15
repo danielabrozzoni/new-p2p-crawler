@@ -2,6 +2,7 @@
 //! framed envelope send/receive primitives (Section 4.1, 4.2).
 
 use crate::protocol::{checksum, frame, MAGIC, MAX_PROTOCOL_MESSAGE_LENGTH};
+use bytes::{Buf, BytesMut};
 use std::io;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,16 +19,44 @@ pub struct Envelope {
 /// A live P2P connection over any transport (all collapse to a TCP stream).
 pub struct Connection {
     stream: TcpStream,
+    recv_buf: BytesMut,
+    frame_started: Option<std::time::Instant>,
+    socket_local: std::net::SocketAddr,
+    socket_peer: std::net::SocketAddr,
 }
 
 impl Connection {
     pub fn new(stream: TcpStream) -> Self {
-        Connection { stream }
+        let socket_local = stream
+            .local_addr()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+        let socket_peer = stream
+            .peer_addr()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+        Connection {
+            stream,
+            recv_buf: BytesMut::with_capacity(8192),
+            frame_started: None,
+            socket_local,
+            socket_peer,
+        }
+    }
+
+    pub fn socket_local(&self) -> std::net::SocketAddr {
+        self.socket_local
+    }
+
+    pub fn socket_peer(&self) -> std::net::SocketAddr {
+        self.socket_peer
+    }
+
+    pub fn has_partial_envelope(&self) -> bool {
+        !self.recv_buf.is_empty()
     }
 
     /// Serialize + send a framed message.
     pub async fn send(&mut self, command: &str, payload: &[u8]) -> io::Result<()> {
-        let bytes = frame(command, payload);
+        let bytes = frame(command, payload)?;
         self.stream.write_all(&bytes).await?;
         Ok(())
     }
@@ -36,26 +65,95 @@ impl Connection {
     /// Returns `Ok(None)` on timeout, `Ok(Some(env))` on a message, and `Err`
     /// on any transport failure (EOF, magic/checksum mismatch, oversize length).
     pub async fn recv_one(&mut self, per_timeout: Duration) -> io::Result<Option<Envelope>> {
-        match timeout(per_timeout, read_envelope(&mut self.stream)).await {
-            Err(_elapsed) => Ok(None),
-            Ok(res) => res.map(Some),
+        const ENVELOPE_HARD_TIMEOUT: Duration = Duration::from_secs(120);
+        let call_deadline = std::time::Instant::now() + per_timeout;
+        loop {
+            if let Some(env) = try_parse_envelope(&mut self.recv_buf)? {
+                self.frame_started = if self.recv_buf.is_empty() {
+                    None
+                } else {
+                    Some(std::time::Instant::now())
+                };
+                return Ok(Some(env));
+            }
+            let hard_remaining = self
+                .frame_started
+                .map(|start| ENVELOPE_HARD_TIMEOUT.saturating_sub(start.elapsed()))
+                .unwrap_or(ENVELOPE_HARD_TIMEOUT);
+            if hard_remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "incomplete envelope exceeded hard deadline",
+                ));
+            }
+            let call_remaining = call_deadline.saturating_duration_since(std::time::Instant::now());
+            if call_remaining.is_zero() {
+                return Ok(None);
+            }
+            let mut chunk = [0u8; 8192];
+            match timeout(
+                call_remaining.min(hard_remaining),
+                self.stream.read(&mut chunk),
+            )
+            .await
+            {
+                Err(_) => return Ok(None),
+                Ok(Err(e)) => return Err(e),
+                Ok(Ok(0)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "peer closed connection",
+                    ))
+                }
+                Ok(Ok(n)) => {
+                    if self.recv_buf.is_empty() {
+                        self.frame_started = Some(std::time::Instant::now());
+                    }
+                    self.recv_buf.extend_from_slice(&chunk[..n]);
+                    if self.recv_buf.len() > 24 + MAX_PROTOCOL_MESSAGE_LENGTH as usize {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "receive buffer limit exceeded",
+                        ));
+                    }
+                }
+            }
         }
     }
 
     /// Answer a `ping` by echoing its exact 8-byte nonce as a `pong` (Section 4.1).
-    pub async fn answer_ping(&mut self, ping_payload: &[u8]) -> io::Result<()> {
-        // Echo the first 8 bytes (the nonce); tolerate short payloads.
-        let mut nonce = [0u8; 8];
-        let n = ping_payload.len().min(8);
-        nonce[..n].copy_from_slice(&ping_payload[..n]);
-        self.send("pong", &nonce).await
+    pub async fn answer_ping(
+        &mut self,
+        ping_payload: &[u8],
+        protocol_version: i32,
+    ) -> io::Result<()> {
+        let expects_nonce = protocol_version > 60000;
+        validate_ping_payload(ping_payload, expects_nonce)?;
+        if expects_nonce {
+            self.send("pong", ping_payload).await
+        } else {
+            Ok(())
+        }
     }
 }
 
-/// Read one full envelope with strict read-exactly framing (Section 4.1).
-async fn read_envelope(stream: &mut TcpStream) -> io::Result<Envelope> {
-    let mut header = [0u8; 24];
-    stream.read_exact(&mut header).await?; // EOF/partial => Err (transport failure)
+fn validate_ping_payload(payload: &[u8], expects_nonce: bool) -> io::Result<()> {
+    if (expects_nonce && payload.len() == 8) || (!expects_nonce && payload.is_empty()) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ping nonce must be exactly 8 bytes",
+        ))
+    }
+}
+
+/// Parse one complete envelope without consuming partial bytes.
+fn try_parse_envelope(buf: &mut BytesMut) -> io::Result<Option<Envelope>> {
+    if buf.len() < 24 {
+        return Ok(None);
+    }
+    let header = &buf[..24];
 
     if header[0..4] != MAGIC {
         return Err(io::Error::new(
@@ -64,7 +162,7 @@ async fn read_envelope(stream: &mut TcpStream) -> io::Result<Envelope> {
         ));
     }
 
-    let command = parse_command(&header[4..16]);
+    let command = parse_command(&header[4..16])?;
     let length = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
     let expected_checksum = [header[20], header[21], header[22], header[23]];
 
@@ -72,12 +170,14 @@ async fn read_envelope(stream: &mut TcpStream) -> io::Result<Envelope> {
     if length > MAX_PROTOCOL_MESSAGE_LENGTH {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("payload length {length} exceeds 4 MiB"),
+            format!("payload length {length} exceeds 4,000,000 bytes"),
         ));
     }
-
-    let mut payload = vec![0u8; length as usize];
-    stream.read_exact(&mut payload).await?;
+    let frame_len = 24 + length as usize;
+    if buf.len() < frame_len {
+        return Ok(None);
+    }
+    let payload = buf[24..frame_len].to_vec();
 
     if checksum(&payload) != expected_checksum {
         return Err(io::Error::new(
@@ -86,12 +186,30 @@ async fn read_envelope(stream: &mut TcpStream) -> io::Result<Envelope> {
         ));
     }
 
-    Ok(Envelope { command, payload })
+    buf.advance(frame_len);
+    Ok(Some(Envelope { command, payload }))
 }
 
-fn parse_command(bytes: &[u8]) -> String {
+fn parse_command(bytes: &[u8]) -> io::Result<String> {
+    if bytes.len() != 12 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "command field is not 12 bytes",
+        ));
+    }
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
+    if end == 0
+        || bytes[..end].iter().any(|b| !(0x20..=0x7e).contains(b))
+        || bytes[end..].iter().any(|b| *b != 0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid command field",
+        ));
+    }
+    Ok(std::str::from_utf8(&bytes[..end])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-ASCII command"))?
+        .to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +222,11 @@ fn parse_command(bytes: &[u8]) -> String {
 /// `SocketAddr` (no `getaddrinfo`) — this also avoids the unbracketed-IPv6
 /// pitfall of `"host:port"` string parsing, which would otherwise force a DNS
 /// lookup on every IPv6/CJDNS connect.
-pub async fn connect_tcp(host: &str, port: u16, connect_timeout: Duration) -> io::Result<TcpStream> {
+pub async fn connect_tcp(
+    host: &str,
+    port: u16,
+    connect_timeout: Duration,
+) -> io::Result<TcpStream> {
     let ip: std::net::IpAddr = host
         .parse()
         .map_err(|_| io::Error::other(format!("not a numeric IP address: {host}")))?;
@@ -147,7 +269,9 @@ async fn socks5_greeting(stream: &mut TcpStream) -> io::Result<()> {
     let mut reply = [0u8; 2];
     stream.read_exact(&mut reply).await?;
     if reply != [0x05, 0x00] {
-        return Err(io::Error::other(format!("socks5 method selection failed: {reply:02x?}")));
+        return Err(io::Error::other(format!(
+            "socks5 method selection failed: {reply:02x?}"
+        )));
     }
     Ok(())
 }
@@ -169,7 +293,10 @@ async fn socks5_connect(stream: &mut TcpStream, host: &str, port: u16) -> io::Re
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).await?;
     if head[1] != 0x00 {
-        return Err(io::Error::other(format!("socks5 connect failed: REP={:#04x}", head[1])));
+        return Err(io::Error::other(format!(
+            "socks5 connect failed: REP={:#04x}",
+            head[1]
+        )));
     }
     // Consume BND.ADDR based on ATYP, then 2-byte BND.PORT.
     let atyp = head[3];
@@ -182,7 +309,9 @@ async fn socks5_connect(stream: &mut TcpStream, host: &str, port: u16) -> io::Re
             l[0] as usize
         }
         other => {
-            return Err(io::Error::other(format!("socks5 reply unknown ATYP {other}")))
+            return Err(io::Error::other(format!(
+                "socks5 reply unknown ATYP {other}"
+            )))
         }
     };
     let mut scratch = vec![0u8; addr_len + 2];
@@ -266,8 +395,10 @@ impl SamSession {
             stream.write_all(cmd.as_bytes()).await?;
             let reply = sam_read_line(&mut stream).await?;
             if !reply.contains("STREAM STATUS") || !reply.contains("RESULT=OK") {
-                return Err(io::Error::other(format!("SAM stream connect failed: {}", reply.trim()),
-                ));
+                return Err(io::Error::other(format!(
+                    "SAM stream connect failed: {}",
+                    reply.trim()
+                )));
             }
             Ok::<_, io::Error>(stream)
         })
@@ -277,13 +408,13 @@ impl SamSession {
 }
 
 async fn sam_hello(stream: &mut TcpStream) -> io::Result<()> {
-    stream
-        .write_all(b"HELLO VERSION MIN=3.0 MAX=3.1\n")
-        .await?;
+    stream.write_all(b"HELLO VERSION MIN=3.0 MAX=3.1\n").await?;
     let reply = sam_read_line(stream).await?;
     if !reply.contains("HELLO REPLY") || !reply.contains("RESULT=OK") {
-        return Err(io::Error::other(format!("SAM HELLO failed: {}", reply.trim()),
-        ));
+        return Err(io::Error::other(format!(
+            "SAM HELLO failed: {}",
+            reply.trim()
+        )));
     }
     Ok(())
 }
@@ -324,4 +455,59 @@ pub async fn sam_probe(
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SAM probe timed out"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_command_field_rejects_suffix_and_non_ascii() {
+        assert_eq!(parse_command(b"addr\0\0\0\0\0\0\0\0").unwrap(), "addr");
+        assert!(parse_command(b"addr\0garbage").is_err());
+        assert!(parse_command(&[0xff; 12]).is_err());
+        assert!(parse_command(&[0; 12]).is_err());
+    }
+
+    #[test]
+    fn parser_handles_multiple_buffered_envelopes() {
+        let mut bytes = BytesMut::new();
+        bytes.extend_from_slice(&frame("ping", &[1; 8]).unwrap());
+        bytes.extend_from_slice(&frame("pong", &[2; 8]).unwrap());
+        assert_eq!(
+            try_parse_envelope(&mut bytes).unwrap().unwrap().command,
+            "ping"
+        );
+        assert_eq!(
+            try_parse_envelope(&mut bytes).unwrap().unwrap().command,
+            "pong"
+        );
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn partial_frame_bytes_remain_buffered() {
+        let framed = frame("ping", &[7; 8]).unwrap();
+        for split in 0..framed.len() {
+            let mut buffered = BytesMut::from(&framed[..split]);
+            assert!(try_parse_envelope(&mut buffered).unwrap().is_none());
+            assert_eq!(&buffered[..], &framed[..split]);
+            buffered.extend_from_slice(&framed[split..]);
+            let envelope = try_parse_envelope(&mut buffered).unwrap().unwrap();
+            assert_eq!(envelope.command, "ping");
+            assert_eq!(envelope.payload, vec![7; 8]);
+        }
+    }
+
+    #[test]
+    fn malformed_ping_is_not_fabricated() {
+        assert_eq!(
+            validate_ping_payload(&[1, 2], true).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(validate_ping_payload(&[0; 8], true).is_ok());
+        assert!(validate_ping_payload(&[0; 9], true).is_err());
+        assert!(validate_ping_payload(&[], false).is_ok());
+        assert!(validate_ping_payload(&[0; 8], false).is_err());
+    }
 }

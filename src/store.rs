@@ -34,6 +34,7 @@ pub enum NodeState {
     HandshakeFailed,
     Unreachable,
     StaleDiscarded,
+    BudgetDiscarded,
 }
 
 /// Why a node ended up in a failure state — the reason recorded alongside a
@@ -61,6 +62,9 @@ pub enum FailKind {
     // ---- Handshake phase (terminal state = HandshakeFailed) ----
     /// Failed to write our `version` message.
     VersionSendFailed,
+    NegotiationSendFailed,
+    VerackSendFailed,
+    PeerVerackTimeout,
     /// Peer stayed silent for the whole handshake deadline.
     HandshakeTimeout,
     /// Peer closed / reset the connection mid-handshake (EOF).
@@ -71,6 +75,7 @@ pub enum FailKind {
     ProtocolDesync,
     /// Any other handshake-phase error.
     HandshakeOther,
+    WorkerFailed,
 }
 
 impl FailKind {
@@ -85,11 +90,15 @@ impl FailKind {
             FailKind::SamError => "sam_error",
             FailKind::ConnectOther => "connect_other",
             FailKind::VersionSendFailed => "version_send_failed",
+            FailKind::NegotiationSendFailed => "negotiation_send_failed",
+            FailKind::VerackSendFailed => "verack_send_failed",
+            FailKind::PeerVerackTimeout => "peer_verack_timeout",
             FailKind::HandshakeTimeout => "handshake_timeout",
             FailKind::ConnectionClosed => "connection_closed",
             FailKind::MalformedVersion => "malformed_version",
             FailKind::ProtocolDesync => "protocol_desync",
             FailKind::HandshakeOther => "handshake_other",
+            FailKind::WorkerFailed => "worker_failed",
         }
     }
 }
@@ -107,10 +116,27 @@ pub struct HandshakeData {
     pub handshake_timestamp: i64,
     /// handshake duration in ms.
     pub handshake_duration_ms: u64,
+    pub requested_endpoint: String,
+    pub transport_destination: String,
+    pub socket_local: String,
+    pub socket_peer: String,
+    pub version_addr_recv: String,
+    pub version_addr_recv_services: u64,
+    pub version_addr_from: Option<String>,
+    pub version_addr_from_services: Option<u64>,
+    pub version_nonce: Option<u64>,
 }
 
 impl HandshakeData {
-    pub fn from_version(v: &VersionData, handshake_timestamp: i64, duration_ms: u64) -> Self {
+    pub fn from_version(
+        v: &VersionData,
+        handshake_timestamp: i64,
+        duration_ms: u64,
+        requested_endpoint: String,
+        transport_destination: String,
+        socket_local: String,
+        socket_peer: String,
+    ) -> Self {
         HandshakeData {
             version: v.version,
             services: v.services,
@@ -120,8 +146,64 @@ impl HandshakeData {
             version_reply_timestamp_remote: v.timestamp,
             handshake_timestamp,
             handshake_duration_ms: duration_ms,
+            requested_endpoint,
+            transport_destination,
+            socket_local,
+            socket_peer,
+            version_addr_recv: render_addr(&v.addr_recv.host, v.addr_recv.port),
+            version_addr_recv_services: v.addr_recv.services,
+            version_addr_from: v.addr_from.as_ref().map(|a| render_addr(&a.host, a.port)),
+            version_addr_from_services: v.addr_from.as_ref().map(|a| a.services),
+            version_nonce: v.nonce,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CollectionOutcome {
+    #[default]
+    NotRequested,
+    CompleteQuiet,
+    NoResponseTimeout,
+    PartialHardTimeout,
+    HardTimeout,
+    SendFailed,
+    MalformedResponse,
+    PartialMalformedResponse,
+    RemoteDisconnect,
+    PartialRemoteDisconnect,
+    IncompleteEnvelopeTimeout,
+    PartialIncompleteEnvelopeTimeout,
+    LogFailed,
+}
+
+impl CollectionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::CompleteQuiet => "complete_quiet",
+            Self::NoResponseTimeout => "no_response_timeout",
+            Self::PartialHardTimeout => "partial_hard_timeout",
+            Self::HardTimeout => "hard_timeout",
+            Self::SendFailed => "send_failed",
+            Self::MalformedResponse => "malformed_response",
+            Self::PartialMalformedResponse => "partial_malformed_response",
+            Self::RemoteDisconnect => "remote_disconnect",
+            Self::PartialRemoteDisconnect => "partial_remote_disconnect",
+            Self::IncompleteEnvelopeTimeout => "incomplete_envelope_timeout",
+            Self::PartialIncompleteEnvelopeTimeout => "partial_incomplete_envelope_timeout",
+            Self::LogFailed => "log_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AttemptData {
+    pub attempt: u32,
+    pub connect_duration_ms: Option<u64>,
+    pub version_send_timestamp: Option<i64>,
+    pub outcome: String,
+    pub failure: Option<FailKind>,
 }
 
 /// Per-node timing / counters / advertised-addr breakdown (Section 2.1, 7).
@@ -142,6 +224,9 @@ pub struct NodeStats {
     pub advertised_i2p: u64,
     pub advertised_cjdns: u64,
     pub advertised_unknown: u64,
+    pub collection_outcome: CollectionOutcome,
+    pub valid_addr_messages: u64,
+    pub malformed_addr_messages: u64,
 }
 
 impl NodeStats {
@@ -169,6 +254,7 @@ pub struct NodeEntry {
     pub stats: NodeStats,
     /// Why this node failed, when in a terminal failure state (Section 7).
     pub failure: Option<FailKind>,
+    pub attempts: Vec<AttemptData>,
 }
 
 impl NodeEntry {
@@ -180,6 +266,7 @@ impl NodeEntry {
             handshake: None,
             stats: NodeStats::default(),
             failure: None,
+            attempts: Vec::new(),
         }
     }
 }
@@ -189,18 +276,36 @@ pub struct NodeStore {
     map: DashMap<AddrKey, NodeEntry>,
     /// Every address in state Queued OR Processing (Section 3.5).
     outstanding: AtomicUsize,
+    entries: AtomicUsize,
+    max_entries: usize,
+    budget_rejected: AtomicUsize,
 }
 
 impl NodeStore {
     pub fn new() -> Self {
+        Self::with_limit(1_000_000)
+    }
+
+    pub fn with_limit(max_entries: usize) -> Self {
         NodeStore {
             map: DashMap::new(),
             outstanding: AtomicUsize::new(0),
+            entries: AtomicUsize::new(0),
+            max_entries,
+            budget_rejected: AtomicUsize::new(0),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.entries.load(Ordering::SeqCst)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn budget_rejected(&self) -> usize {
+        self.budget_rejected.load(Ordering::SeqCst)
     }
 
     pub fn outstanding(&self) -> usize {
@@ -221,6 +326,10 @@ impl NodeStore {
     /// Access an entry mutably under its shard lock.
     pub fn with_entry<R>(&self, key: &AddrKey, f: impl FnOnce(&mut NodeEntry) -> R) -> Option<R> {
         self.map.get_mut(key).map(|mut e| f(e.value_mut()))
+    }
+
+    pub fn network_of(&self, key: &AddrKey) -> Option<NetworkType> {
+        self.map.get(key).map(|entry| entry.network)
     }
 
     /// Iterate every entry (for output). Clones to avoid holding shard locks.
@@ -245,9 +354,16 @@ impl NodeStore {
             Entry::Occupied(mut o) => {
                 let e = o.get_mut();
                 e.freshest_ts = e.freshest_ts.max(now);
-                SeedOutcome { newly_queued: false }
+                SeedOutcome {
+                    newly_queued: false,
+                }
             }
             Entry::Vacant(v) => {
+                if !self.reserve_entry() {
+                    return SeedOutcome {
+                        newly_queued: false,
+                    };
+                }
                 v.insert(NodeEntry::new(network, now, NodeState::Queued));
                 // outstanding incremented by caller's enqueue().
                 SeedOutcome { newly_queued: true }
@@ -283,9 +399,16 @@ impl NodeStore {
                 FrontierOutcome::Enqueue
             }
             Entry::Vacant(v) => {
+                if !self.reserve_entry() {
+                    return FrontierOutcome::BudgetRejected;
+                }
                 // Brand-new address.
                 if freshness_threshold > 0 && observed_ts < now - freshness_threshold {
-                    v.insert(NodeEntry::new(network, observed_ts, NodeState::StaleDiscarded));
+                    v.insert(NodeEntry::new(
+                        network,
+                        observed_ts,
+                        NodeState::StaleDiscarded,
+                    ));
                     FrontierOutcome::StaleNew
                 } else {
                     v.insert(NodeEntry::new(network, observed_ts, NodeState::Queued));
@@ -293,6 +416,19 @@ impl NodeStore {
                 }
             }
         }
+    }
+
+    fn reserve_entry(&self) -> bool {
+        let reserved = self
+            .entries
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < self.max_entries).then_some(n + 1)
+            })
+            .is_ok();
+        if !reserved {
+            self.budget_rejected.fetch_add(1, Ordering::SeqCst);
+        }
+        reserved
     }
 }
 
@@ -317,6 +453,8 @@ pub enum FrontierOutcome {
     StaleNew,
     /// Was StaleDiscarded and still stale; do nothing.
     StillStale,
+    /// Crawl-wide unique-address budget exhausted; claim was not inserted.
+    BudgetRejected,
 }
 
 /// Per-network-type count breakdown (Section 7.2).
@@ -344,5 +482,28 @@ impl NetworkBreakdown {
             NetworkType::Cjdns => self.cjdns += 1,
             NetworkType::Unknown => self.unknown += 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unique_address_budget_is_strict_and_counted() {
+        let store = NodeStore::with_limit(1);
+        assert!(store.is_empty());
+        assert!(
+            store
+                .observe_seed(AddrKey::new("1.2.3.4", 8333), 1)
+                .newly_queued
+        );
+        assert!(
+            !store
+                .observe_seed(AddrKey::new("5.6.7.8", 8333), 1)
+                .newly_queued
+        );
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.budget_rejected(), 1);
     }
 }

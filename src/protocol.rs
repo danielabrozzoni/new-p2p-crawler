@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 /// Mainnet network magic (Section 4.1).
 pub const MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
 
-/// Maximum accepted payload length: 4 MiB (Section 4.1).
-pub const MAX_PROTOCOL_MESSAGE_LENGTH: u32 = 4 * 1024 * 1024;
+/// Bitcoin Core's exact maximum protocol payload size.
+pub const MAX_PROTOCOL_MESSAGE_LENGTH: u32 = 4_000_000;
 
 /// Bitcoin Core's `MAX_ADDR_TO_SEND` (Section 3.3 early-exit).
 pub const MAX_ADDR_TO_SEND: usize = 1000;
@@ -18,7 +18,9 @@ pub const MAX_ADDR_TO_SEND: usize = 1000;
 /// Protocol version advertised by the crawler (Section 4.3).
 pub const PROTOCOL_VERSION: i32 = 70016;
 /// User agent advertised by the crawler (Section 4.3).
-pub const USER_AGENT: &str = "/Satoshi:27.0.0/";
+pub const USER_AGENT: &str = "/new-p2p-crawler:0.1.0/";
+/// Bitcoin Core's maximum accepted subversion/user-agent string length.
+pub const MAX_SUBVERSION_LENGTH: usize = 256;
 
 /// Double-SHA256, returning the first 4 bytes (the envelope checksum).
 pub fn checksum(payload: &[u8]) -> [u8; 4] {
@@ -28,17 +30,39 @@ pub fn checksum(payload: &[u8]) -> [u8; 4] {
 }
 
 /// Serialize a full message envelope (header + payload) for `command`.
-pub fn frame(command: &str, payload: &[u8]) -> Vec<u8> {
+pub fn frame(command: &str, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    validate_command(command)?;
+    let payload_len: u32 = payload
+        .len()
+        .try_into()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "payload too large"))?;
+    if payload_len > MAX_PROTOCOL_MESSAGE_LENGTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "payload exceeds protocol limit",
+        ));
+    }
     let mut out = Vec::with_capacity(24 + payload.len());
     out.extend_from_slice(&MAGIC);
     let mut cmd = [0u8; 12];
     let bytes = command.as_bytes();
     cmd[..bytes.len()].copy_from_slice(bytes);
     out.extend_from_slice(&cmd);
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload_len.to_le_bytes());
     out.extend_from_slice(&checksum(payload));
     out.extend_from_slice(payload);
-    out
+    Ok(out)
+}
+
+fn validate_command(command: &str) -> std::io::Result<()> {
+    let bytes = command.as_bytes();
+    if bytes.is_empty() || bytes.len() > 12 || bytes.iter().any(|b| !(0x20..=0x7e).contains(b)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "command must be 1..=12 printable ASCII bytes",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +106,10 @@ impl<'a> Cursor<'a> {
         Some(slice)
     }
 
+    pub fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
     pub fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
     }
@@ -116,13 +144,29 @@ impl<'a> Cursor<'a> {
         Some(self.u64_le()? as i64)
     }
 
-    /// Decode a CompactSize (minimality not enforced on decode, Section 4.3.0).
+    /// Decode CompactSize without imposing caller-specific minimality policy.
     pub fn compact_size(&mut self) -> Option<u64> {
         match self.u8()? {
             0xFF => self.u64_le(),
             0xFE => self.u32_le().map(|v| v as u64),
             0xFD => self.u16_le().map(|v| v as u64),
             n => Some(n as u64),
+        }
+    }
+
+    pub fn compact_size_canonical(&mut self) -> Option<u64> {
+        let prefix = self.u8()?;
+        let value = match prefix {
+            0xFF => self.u64_le()?,
+            0xFE => self.u32_le()? as u64,
+            0xFD => self.u16_le()? as u64,
+            n => n as u64,
+        };
+        match prefix {
+            0xFF if value <= 0xffff_ffff => None,
+            0xFE if value <= 0xffff => None,
+            0xFD if value < 0xfd => None,
+            _ => Some(value),
         }
     }
 }
@@ -140,6 +184,17 @@ pub struct VersionData {
     pub user_agent: String,
     pub latest_block: i32,
     pub relay: bool,
+    pub addr_recv: VersionNetAddr,
+    pub addr_from: Option<VersionNetAddr>,
+    pub nonce: Option<u64>,
+}
+
+/// A legacy network address claimed inside a peer's `version` message.
+#[derive(Debug, Clone)]
+pub struct VersionNetAddr {
+    pub services: u64,
+    pub host: String,
+    pub port: u16,
 }
 
 /// Serialize the crawler's own `version` payload (Section 4.3).
@@ -148,7 +203,7 @@ pub fn build_version(timestamp: i64, nonce: u64) -> Vec<u8> {
     out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes()); // version
     out.extend_from_slice(&0u64.to_le_bytes()); // services = 0
     out.extend_from_slice(&timestamp.to_le_bytes()); // timestamp
-    // addr_recv: services(8) + IP(16 = ::ffff:0.0.0.0) + port(2 BE)
+                                                     // addr_recv: services(8) + IP(16 = ::ffff:0.0.0.0) + port(2 BE)
     write_zero_netaddr(&mut out);
     // addr_from: same
     write_zero_netaddr(&mut out);
@@ -162,7 +217,7 @@ pub fn build_version(timestamp: i64, nonce: u64) -> Vec<u8> {
 
 fn write_zero_netaddr(out: &mut Vec<u8>) {
     out.extend_from_slice(&0u64.to_le_bytes()); // services
-    // ::ffff:0.0.0.0
+                                                // ::ffff:0.0.0.0
     out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0, 0, 0, 0]);
     out.extend_from_slice(&0u16.to_be_bytes()); // port
 }
@@ -173,19 +228,23 @@ pub fn parse_version(payload: &[u8]) -> Option<VersionData> {
     let version = c.i32_le()?;
     let services = c.u64_le()?;
     let timestamp = c.i64_le()?;
-    // addr_recv (26 bytes): services(8) + IP(16) + port(2)
-    c.take(26)?;
+    let addr_recv = parse_version_netaddr(&mut c)?;
 
     let mut user_agent = String::new();
     let mut latest_block = 0i32;
     // Absent relay is recorded as true (Core convention, Section 4.3/4.4).
     let mut relay = true;
+    let mut addr_from = None;
+    let mut nonce = None;
 
     // addr_from..user_agent..latest_block requires version >= 106.
     if version >= 106 {
-        c.take(26)?; // addr_from
-        c.take(8)?; // nonce
-        let ua_len = c.compact_size()? as usize;
+        addr_from = Some(parse_version_netaddr(&mut c)?);
+        nonce = Some(c.u64_le()?);
+        let ua_len: usize = c.compact_size_canonical()?.try_into().ok()?;
+        if ua_len > MAX_SUBVERSION_LENGTH {
+            return None;
+        }
         let ua_bytes = c.take(ua_len)?;
         user_agent = match std::str::from_utf8(ua_bytes) {
             Ok(s) => s.to_string(),
@@ -208,6 +267,23 @@ pub fn parse_version(payload: &[u8]) -> Option<VersionData> {
         user_agent,
         latest_block,
         relay,
+        addr_recv,
+        addr_from,
+        nonce,
+    })
+}
+
+fn parse_version_netaddr(c: &mut Cursor<'_>) -> Option<VersionNetAddr> {
+    let services = c.u64_le()?;
+    let ip = c.take(16)?;
+    let port = c.u16_be()?;
+    let mut octets = [0u8; 16];
+    octets.copy_from_slice(ip);
+    let (host, _) = decode_legacy_ip(&octets);
+    Some(VersionNetAddr {
+        services,
+        host,
+        port,
     })
 }
 
@@ -231,72 +307,101 @@ pub struct AdvertisedAddr {
     pub network: NetworkType,
     /// Literal last-seen timestamp from the response, zero-extended (Section 4.3).
     pub timestamp: i64,
+    pub services: u64,
+    pub wire_network_id: u8,
 }
 
-/// Parse a legacy `addr` payload (Section 4.3). Defensive: returns what was
-/// decoded before any truncation. A truncated count returns empty.
-pub fn parse_addr(payload: &[u8]) -> Vec<AdvertisedAddr> {
+#[derive(Debug, Clone)]
+pub struct ParsedAddrMessage {
+    pub declared_count: u64,
+    pub addrs: Vec<AdvertisedAddr>,
+    pub unknown_entries: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddrParseError {
+    NonCanonicalOrTruncated,
+    TooMany(u64),
+    WrongLength { network_id: u8, length: usize },
+    InvalidNetworkEncoding(u8),
+    TrailingBytes(usize),
+}
+
+impl std::fmt::Display for AddrParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonCanonicalOrTruncated => {
+                f.write_str("non-canonical or truncated address message")
+            }
+            Self::TooMany(n) => write!(f, "declared address count {n} exceeds {MAX_ADDR_TO_SEND}"),
+            Self::WrongLength { network_id, length } => {
+                write!(f, "wrong length {length} for BIP155 network {network_id}")
+            }
+            Self::InvalidNetworkEncoding(id) => {
+                write!(f, "invalid encoding for BIP155 network {id}")
+            }
+            Self::TrailingBytes(n) => write!(f, "{n} trailing bytes after address vector"),
+        }
+    }
+}
+
+impl std::error::Error for AddrParseError {}
+
+/// Parse a legacy `addr` payload atomically. No prefix is returned on error.
+pub fn parse_addr(payload: &[u8]) -> Result<ParsedAddrMessage, AddrParseError> {
     let mut c = Cursor::new(payload);
-    let count = match c.compact_size() {
-        Some(n) => n,
-        None => return Vec::new(),
-    };
-    let mut out = Vec::new();
+    let count = c
+        .compact_size_canonical()
+        .ok_or(AddrParseError::NonCanonicalOrTruncated)?;
+    check_addr_count(count)?;
+    let mut out = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let ts = match c.u32_le() {
-            Some(t) => t as i64, // zero-extend (unsigned)
-            None => break,
-        };
-        if c.take(8).is_none() {
-            break;
-        } // services, discarded
-        let ip = match c.take(16) {
-            Some(b) => b,
-            None => break,
-        };
-        let port = match c.u16_be() {
-            Some(p) => p,
-            None => break,
-        };
+        let ts = c.u32_le().ok_or(AddrParseError::NonCanonicalOrTruncated)? as i64;
+        let services = c.u64_le().ok_or(AddrParseError::NonCanonicalOrTruncated)?;
+        let ip = c.take(16).ok_or(AddrParseError::NonCanonicalOrTruncated)?;
+        let port = c.u16_be().ok_or(AddrParseError::NonCanonicalOrTruncated)?;
         let mut arr = [0u8; 16];
         arr.copy_from_slice(ip);
-        let (host, network) = decode_ipv6_mapped(&arr);
+        let (host, network) = decode_legacy_ip(&arr);
         out.push(AdvertisedAddr {
             host,
             port,
             network,
             timestamp: ts,
+            services,
+            wire_network_id: 2,
         });
     }
-    out
+    finish_addr_parse(c, count, out, 0)
 }
 
-/// Parse a BIP155 `addrv2` payload (Section 4.3). Defensive: stops on truncation,
-/// unknown net id, or length mismatch, returning what was decoded so far.
-pub fn parse_addrv2(payload: &[u8]) -> Vec<AdvertisedAddr> {
+/// Parse BIP155 atomically. Unknown future ids are consumed and skipped.
+pub fn parse_addrv2(payload: &[u8]) -> Result<ParsedAddrMessage, AddrParseError> {
     let mut c = Cursor::new(payload);
-    let count = match c.compact_size() {
-        Some(n) => n,
-        None => return Vec::new(),
-    };
-    let mut out = Vec::new();
+    let count = c
+        .compact_size_canonical()
+        .ok_or(AddrParseError::NonCanonicalOrTruncated)?;
+    check_addr_count(count)?;
+    let mut out = Vec::with_capacity(count as usize);
+    let mut unknown_entries = 0;
     for _ in 0..count {
-        let ts = match c.u32_le() {
-            Some(t) => t as i64,
-            None => break,
-        };
-        if c.compact_size().is_none() {
-            break;
-        } // services, discarded
-        let net_id = match c.u8() {
-            Some(n) => n,
-            None => break,
-        };
-        let addr_len = match c.compact_size() {
-            Some(l) => l as usize,
-            None => break,
-        };
-        // Expected fixed length per net id (Section 4.3).
+        let ts = c.u32_le().ok_or(AddrParseError::NonCanonicalOrTruncated)? as i64;
+        let services = c
+            .compact_size_canonical()
+            .ok_or(AddrParseError::NonCanonicalOrTruncated)?;
+        let net_id = c.u8().ok_or(AddrParseError::NonCanonicalOrTruncated)?;
+        let addr_len_u64 = c
+            .compact_size_canonical()
+            .ok_or(AddrParseError::NonCanonicalOrTruncated)?;
+        let addr_len: usize = addr_len_u64
+            .try_into()
+            .map_err(|_| AddrParseError::NonCanonicalOrTruncated)?;
+        if addr_len > 512 {
+            return Err(AddrParseError::WrongLength {
+                network_id: net_id,
+                length: addr_len,
+            });
+        }
         let expected = match net_id {
             1 => 4,
             2 => 16,
@@ -304,43 +409,63 @@ pub fn parse_addrv2(payload: &[u8]) -> Vec<AdvertisedAddr> {
             4 => 32,
             5 => 32,
             6 => 16,
-            _ => {
-                // Unknown net id: parsing stops (defensive).
-                break;
-            }
+            _ => addr_len,
         };
         if addr_len != expected {
-            break; // length mismatch: stop (defensive)
+            return Err(AddrParseError::WrongLength {
+                network_id: net_id,
+                length: addr_len,
+            });
         }
-        let addr_bytes = match c.take(addr_len) {
-            Some(b) => b,
-            None => break,
-        };
-        let port = match c.u16_be() {
-            Some(p) => p,
-            None => break,
-        };
-        let (host, network) = match decode_addrv2(net_id, addr_bytes) {
-            Some(v) => v,
-            None => break,
+        let addr_bytes = c
+            .take(addr_len)
+            .ok_or(AddrParseError::NonCanonicalOrTruncated)?;
+        let port = c.u16_be().ok_or(AddrParseError::NonCanonicalOrTruncated)?;
+        let Some((host, network)) = decode_addrv2(net_id, addr_bytes)? else {
+            unknown_entries += 1;
+            continue;
         };
         out.push(AdvertisedAddr {
             host,
             port,
             network,
             timestamp: ts,
+            services,
+            wire_network_id: net_id,
         });
     }
-    out
+    finish_addr_parse(c, count, out, unknown_entries)
+}
+
+fn check_addr_count(count: u64) -> Result<(), AddrParseError> {
+    if count > MAX_ADDR_TO_SEND as u64 {
+        Err(AddrParseError::TooMany(count))
+    } else {
+        Ok(())
+    }
+}
+
+fn finish_addr_parse(
+    c: Cursor<'_>,
+    count: u64,
+    addrs: Vec<AdvertisedAddr>,
+    unknown_entries: u64,
+) -> Result<ParsedAddrMessage, AddrParseError> {
+    if c.remaining() != 0 {
+        return Err(AddrParseError::TrailingBytes(c.remaining()));
+    }
+    Ok(ParsedAddrMessage {
+        declared_count: count,
+        addrs,
+        unknown_entries,
+    })
 }
 
 /// Decode a 16-byte IPv6 field, collapsing IPv4-mapped to dotted quad.
-fn decode_ipv6_mapped(arr: &[u8; 16]) -> (String, NetworkType) {
+fn decode_legacy_ip(arr: &[u8; 16]) -> (String, NetworkType) {
     let addr = std::net::Ipv6Addr::from(*arr);
     if let Some(v4) = ipv4_mapped(&addr) {
         (v4.to_string(), NetworkType::Ipv4)
-    } else if arr[0] == 0xfc {
-        (compact_ipv6(&addr), NetworkType::Cjdns)
     } else {
         (compact_ipv6(&addr), NetworkType::Ipv6)
     }
@@ -359,39 +484,50 @@ fn compact_ipv6(addr: &std::net::Ipv6Addr) -> String {
     addr.to_string()
 }
 
-fn decode_addrv2(net_id: u8, bytes: &[u8]) -> Option<(String, NetworkType)> {
+fn decode_addrv2(
+    net_id: u8,
+    bytes: &[u8],
+) -> Result<Option<(String, NetworkType)>, AddrParseError> {
     match net_id {
         1 => {
             let v4 = std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
-            Some((v4.to_string(), NetworkType::Ipv4))
+            Ok(Some((v4.to_string(), NetworkType::Ipv4)))
         }
         2 => {
             let mut arr = [0u8; 16];
             arr.copy_from_slice(bytes);
-            Some(decode_ipv6_mapped(&arr))
+            let addr = std::net::Ipv6Addr::from(arr);
+            if ipv4_mapped(&addr).is_some() || arr[0] == 0xfc {
+                return Err(AddrParseError::InvalidNetworkEncoding(net_id));
+            }
+            Ok(Some((compact_ipv6(&addr), NetworkType::Ipv6)))
         }
         3 => {
             // torv2: base32(10 bytes) + .onion (defunct, kept for completeness)
             let label = BASE32_NOPAD.encode(bytes).to_lowercase();
-            Some((format!("{label}.onion"), NetworkType::OnionV2))
+            Ok(Some((format!("{label}.onion"), NetworkType::OnionV2)))
         }
         4 => {
             // torv3: label = base32(pubkey || checksum || 0x03)
-            let host = encode_onion_v3(bytes)?;
-            Some((host, NetworkType::OnionV3))
+            let host =
+                encode_onion_v3(bytes).ok_or(AddrParseError::InvalidNetworkEncoding(net_id))?;
+            Ok(Some((host, NetworkType::OnionV3)))
         }
         5 => {
             // i2p: base32(32 bytes) => 56 chars, strip padding, + .b32.i2p
             let label = BASE32_NOPAD.encode(bytes).to_lowercase();
-            Some((format!("{label}.b32.i2p"), NetworkType::I2p))
+            Ok(Some((format!("{label}.b32.i2p"), NetworkType::I2p)))
         }
         6 => {
             let mut arr = [0u8; 16];
             arr.copy_from_slice(bytes);
+            if arr[0] != 0xfc {
+                return Err(AddrParseError::InvalidNetworkEncoding(net_id));
+            }
             let addr = std::net::Ipv6Addr::from(arr);
-            Some((compact_ipv6(&addr), NetworkType::Cjdns))
+            Ok(Some((compact_ipv6(&addr), NetworkType::Cjdns)))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -426,7 +562,15 @@ mod tests {
 
     #[test]
     fn compact_size_roundtrip() {
-        for v in [0u64, 0xFC, 0xFD, 0xFFFF, 0x1_0000, 0xFFFF_FFFF, 0x1_0000_0000] {
+        for v in [
+            0u64,
+            0xFC,
+            0xFD,
+            0xFFFF,
+            0x1_0000,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+        ] {
             let mut buf = Vec::new();
             write_compact_size(&mut buf, v);
             let mut c = Cursor::new(&buf);
@@ -455,6 +599,26 @@ mod tests {
     }
 
     #[test]
+    fn version_rejects_oversize_and_noncanonical_user_agents() {
+        const USER_AGENT_OFFSET: usize = 80;
+        let base = build_version(1, 2);
+
+        let mut oversized = base[..USER_AGENT_OFFSET].to_vec();
+        write_compact_size(&mut oversized, (MAX_SUBVERSION_LENGTH + 1) as u64);
+        oversized.extend(std::iter::repeat_n(b'x', MAX_SUBVERSION_LENGTH + 1));
+        oversized.extend_from_slice(&0i32.to_le_bytes());
+        oversized.push(0);
+        assert!(parse_version(&oversized).is_none());
+
+        let mut noncanonical = base[..USER_AGENT_OFFSET].to_vec();
+        noncanonical.extend_from_slice(&[0xfd, 1, 0]);
+        noncanonical.push(b'x');
+        noncanonical.extend_from_slice(&0i32.to_le_bytes());
+        noncanonical.push(0);
+        assert!(parse_version(&noncanonical).is_none());
+    }
+
+    #[test]
     fn addr_timestamp_zero_extends() {
         // Build one addr record with a high-bit timestamp.
         let mut payload = Vec::new();
@@ -463,11 +627,11 @@ mod tests {
         payload.extend_from_slice(&0u64.to_le_bytes()); // services
         payload.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 1, 2, 3, 4]);
         payload.extend_from_slice(&8333u16.to_be_bytes());
-        let addrs = parse_addr(&payload);
-        assert_eq!(addrs.len(), 1);
-        assert_eq!(addrs[0].timestamp, 0xFFFF_FFFF); // zero-extended, not -1
-        assert_eq!(addrs[0].host, "1.2.3.4");
-        assert_eq!(addrs[0].network, NetworkType::Ipv4);
+        let parsed = parse_addr(&payload).unwrap();
+        assert_eq!(parsed.addrs.len(), 1);
+        assert_eq!(parsed.addrs[0].timestamp, 0xFFFF_FFFF); // zero-extended, not -1
+        assert_eq!(parsed.addrs[0].host, "1.2.3.4");
+        assert_eq!(parsed.addrs[0].network, NetworkType::Ipv4);
     }
 
     #[test]
@@ -481,10 +645,28 @@ mod tests {
         write_compact_size(&mut payload, 32); // addr len
         payload.extend_from_slice(&pubkey);
         payload.extend_from_slice(&8333u16.to_be_bytes());
-        let addrs = parse_addrv2(&payload);
-        assert_eq!(addrs.len(), 1);
-        assert_eq!(addrs[0].network, NetworkType::OnionV3);
-        assert_eq!(classify(&addrs[0].host), NetworkType::OnionV3);
+        let parsed = parse_addrv2(&payload).unwrap();
+        assert_eq!(parsed.addrs.len(), 1);
+        assert_eq!(parsed.addrs[0].network, NetworkType::OnionV3);
+        assert_eq!(classify(&parsed.addrs[0].host), NetworkType::OnionV3);
+    }
+
+    #[test]
+    fn addrv2_torv2_is_decoded_and_counted_as_known() {
+        let mut payload = Vec::new();
+        write_compact_size(&mut payload, 1);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        write_compact_size(&mut payload, 0);
+        payload.push(3);
+        write_compact_size(&mut payload, 10);
+        payload.extend_from_slice(&[0u8; 10]);
+        payload.extend_from_slice(&8333u16.to_be_bytes());
+
+        let parsed = parse_addrv2(&payload).unwrap();
+        assert_eq!(parsed.unknown_entries, 0);
+        assert_eq!(parsed.addrs.len(), 1);
+        assert_eq!(parsed.addrs[0].network, NetworkType::OnionV2);
+        assert_eq!(classify(&parsed.addrs[0].host), NetworkType::OnionV2);
     }
 
     #[test]
@@ -497,6 +679,92 @@ mod tests {
         write_compact_size(&mut payload, 16); // wrong length
         payload.extend_from_slice(&[0u8; 16]);
         payload.extend_from_slice(&8333u16.to_be_bytes());
-        assert!(parse_addrv2(&payload).is_empty());
+        assert_eq!(
+            parse_addrv2(&payload).unwrap_err(),
+            AddrParseError::WrongLength {
+                network_id: 1,
+                length: 16
+            }
+        );
+    }
+
+    #[test]
+    fn address_vectors_reject_noncanonical_oversize_truncated_and_trailing() {
+        assert_eq!(
+            parse_addr(&[0xfd, 1, 0]).unwrap_err(),
+            AddrParseError::NonCanonicalOrTruncated
+        );
+        let mut oversized = Vec::new();
+        write_compact_size(&mut oversized, 1001);
+        assert_eq!(
+            parse_addr(&oversized).unwrap_err(),
+            AddrParseError::TooMany(1001)
+        );
+
+        let mut truncated = vec![1];
+        truncated.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            parse_addr(&truncated).unwrap_err(),
+            AddrParseError::NonCanonicalOrTruncated
+        );
+        assert_eq!(
+            parse_addr(&[0, 42]).unwrap_err(),
+            AddrParseError::TrailingBytes(1)
+        );
+    }
+
+    #[test]
+    fn unknown_addrv2_network_is_consumed_before_later_valid_entry() {
+        let mut payload = vec![2];
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.push(0); // services
+        payload.push(99); // future network
+        payload.push(3); // address length
+        payload.extend_from_slice(&[1, 2, 3]);
+        payload.extend_from_slice(&8333u16.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.push(0);
+        payload.push(1); // IPv4
+        payload.push(4);
+        payload.extend_from_slice(&[1, 2, 3, 4]);
+        payload.extend_from_slice(&8333u16.to_be_bytes());
+        let parsed = parse_addrv2(&payload).unwrap();
+        assert_eq!(parsed.declared_count, 2);
+        assert_eq!(parsed.unknown_entries, 1);
+        assert_eq!(parsed.addrs.len(), 1);
+        assert_eq!(parsed.addrs[0].host, "1.2.3.4");
+    }
+
+    #[test]
+    fn wire_network_pairing_is_enforced() {
+        let mapped = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4];
+        assert_eq!(
+            decode_addrv2(2, &mapped).unwrap_err(),
+            AddrParseError::InvalidNetworkEncoding(2)
+        );
+        assert_eq!(
+            decode_addrv2(6, &[0x20; 16]).unwrap_err(),
+            AddrParseError::InvalidNetworkEncoding(6)
+        );
+        let mut cjdns = [0u8; 16];
+        cjdns[0] = 0xfc;
+        assert_eq!(
+            decode_addrv2(6, &cjdns).unwrap().unwrap().1,
+            NetworkType::Cjdns
+        );
+    }
+
+    #[test]
+    fn legacy_fc_address_remains_ipv6() {
+        let mut address = [0u8; 16];
+        address[0] = 0xfc;
+        assert_eq!(decode_legacy_ip(&address).1, NetworkType::Ipv6);
+    }
+
+    #[test]
+    fn frame_validates_internal_commands_and_payload_limit() {
+        assert!(frame("this-command-is-too-long", &[]).is_err());
+        assert!(frame("bad\0command", &[]).is_err());
+        assert!(frame("ping", &vec![0; MAX_PROTOCOL_MESSAGE_LENGTH as usize + 1]).is_err());
     }
 }

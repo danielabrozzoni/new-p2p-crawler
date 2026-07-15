@@ -1,36 +1,46 @@
 //! Crawler core: per-transport work queues + worker pools, the node worker
 //! (connect → handshake → getaddr), and the status monitor (Sections 3.2–3.8).
 
-use crate::addrlog::{AddrLog, Responder};
 use crate::address::{classify, NetworkType, Transport};
+use crate::addrlog::{AddrLog, Responder};
 use crate::protocol::{
-    build_version, parse_addr, parse_addrv2, parse_version, AdvertisedAddr, VersionData,
-    MAX_ADDR_TO_SEND,
+    build_version, parse_addr, parse_addrv2, parse_version, AdvertisedAddr, ParsedAddrMessage,
+    VersionData,
 };
 use crate::settings::Settings;
-use crate::store::{AddrKey, FailKind, FrontierOutcome, HandshakeData, NodeState, NodeStore};
-use crate::transport::{
-    connect_socks5, connect_tcp, Connection, SamSession,
+use crate::store::{
+    AddrKey, AttemptData, CollectionOutcome, FailKind, FrontierOutcome, HandshakeData, NodeState,
+    NodeStore,
 };
+use crate::transport::{connect_socks5, connect_tcp, Connection, SamSession};
 use rand::seq::SliceRandom;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
 
 /// The set of per-transport queues (each an async MPMC channel, Section 3.5).
 struct Queues {
-    ip: (async_channel::Sender<AddrKey>, async_channel::Receiver<AddrKey>),
-    tor: (async_channel::Sender<AddrKey>, async_channel::Receiver<AddrKey>),
-    i2p: (async_channel::Sender<AddrKey>, async_channel::Receiver<AddrKey>),
+    ip: (
+        async_channel::Sender<AddrKey>,
+        async_channel::Receiver<AddrKey>,
+    ),
+    tor: (
+        async_channel::Sender<AddrKey>,
+        async_channel::Receiver<AddrKey>,
+    ),
+    i2p: (
+        async_channel::Sender<AddrKey>,
+        async_channel::Receiver<AddrKey>,
+    ),
 }
 
 impl Queues {
-    fn new() -> Self {
+    fn new(capacity: usize) -> Self {
         Queues {
-            ip: async_channel::unbounded(),
-            tor: async_channel::unbounded(),
-            i2p: async_channel::unbounded(),
+            ip: async_channel::bounded(capacity),
+            tor: async_channel::bounded(capacity),
+            i2p: async_channel::bounded(capacity),
         }
     }
 
@@ -64,13 +74,17 @@ pub struct Crawler {
     queues: Queues,
     num_processed: AtomicUsize,
     /// Lazily-created shared I2P SAM session (Section 4.2.2, 5).
-    sam: OnceCell<Option<Arc<SamSession>>>,
+    sam: Mutex<Option<Arc<SamSession>>>,
     addr_log: Option<Arc<AddrLog>>,
     /// Crawl start clock (Section 3.8).
     pub start_clock: Instant,
     /// Set when a shutdown was requested (e.g. Ctrl+C): workers stop pulling new
     /// work after finishing their current node, so the crawl drains and exits.
     shutdown: AtomicBool,
+    node_limit_reached: AtomicBool,
+    worker_failed: AtomicBool,
+    output_failed: AtomicBool,
+    observation_barrier: RwLock<()>,
 }
 
 impl Crawler {
@@ -79,15 +93,20 @@ impl Crawler {
         settings: Arc<Settings>,
         addr_log: Option<Arc<AddrLog>>,
     ) -> Self {
+        let queue_capacity = settings.max_addresses;
         Crawler {
             store,
             settings,
-            queues: Queues::new(),
+            queues: Queues::new(queue_capacity),
             num_processed: AtomicUsize::new(0),
-            sam: OnceCell::new(),
+            sam: Mutex::new(None),
             addr_log,
             start_clock: Instant::now(),
             shutdown: AtomicBool::new(false),
+            node_limit_reached: AtomicBool::new(false),
+            worker_failed: AtomicBool::new(false),
+            output_failed: AtomicBool::new(false),
+            observation_barrier: RwLock::new(()),
         }
     }
 
@@ -95,14 +114,32 @@ impl Crawler {
         self.num_processed.load(Ordering::SeqCst)
     }
 
+    pub fn mark_output_failed(&self) {
+        self.output_failed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn terminated_early(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst) || self.node_limit_reached.load(Ordering::SeqCst)
+    }
+
+    pub async fn checkpoint_barrier(&self) -> RwLockWriteGuard<'_, ()> {
+        self.observation_barrier.write().await
+    }
+
     /// Enqueue a key already set to `Queued` in the store: count it in
     /// `outstanding` before it becomes visible, then push it (Section 3.5).
     fn enqueue(&self, key: AddrKey) {
-        let transport = classify(&key.host).transport();
+        let transport = self
+            .store
+            .network_of(&key)
+            .unwrap_or_else(|| classify(&key.host))
+            .transport();
         self.store.incr_outstanding();
         // Unbounded channel: send completes immediately. If closed (crawl ending)
         // undo the outstanding increment so termination is not blocked.
-        if self.queues.sender(transport).try_send(key).is_err() {
+        if self.queues.sender(transport).try_send(key.clone()).is_err() {
+            self.store
+                .with_entry(&key, |entry| entry.state = NodeState::BudgetDiscarded);
             self.store.decr_outstanding();
         }
     }
@@ -116,24 +153,31 @@ impl Crawler {
     /// any); close all queues if it was the last outstanding work in the crawl
     /// (Section 3.5 `finish`).
     fn finish(&self, key: &AddrKey, terminal: NodeState, reason: Option<FailKind>) {
-        self.store.with_entry(key, |e| {
-            e.state = terminal;
-            e.failure = reason;
-        });
-        if self.store.decr_outstanding() == 1 {
+        let was_active = self
+            .store
+            .with_entry(key, |e| {
+                let active = matches!(e.state, NodeState::Queued | NodeState::Processing);
+                if active {
+                    e.state = terminal;
+                    e.failure = reason;
+                }
+                active
+            })
+            .unwrap_or(false);
+        if was_active && self.store.decr_outstanding() == 1 {
             self.queues.close_all();
         }
     }
 
     /// Run the full crawl: spawn per-transport pools + monitor, await completion.
-    pub async fn run(self: Arc<Self>) {
+    pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         // Nothing to crawl (e.g. all DNS seeds failed): close queues so workers
         // exit immediately instead of blocking on recv forever.
         if self.store.outstanding() == 0 {
             self.queues.close_all();
         }
 
-        let mut handles = Vec::new();
+        let mut workers = tokio::task::JoinSet::new();
 
         // One pool of `concurrency[T]` workers per transport (Section 3.5).
         for (transport, count) in [
@@ -143,9 +187,9 @@ impl Crawler {
         ] {
             for _ in 0..count {
                 let me = Arc::clone(&self);
-                handles.push(tokio::spawn(async move {
+                workers.spawn(async move {
                     me.worker_loop(transport).await;
-                }));
+                });
             }
         }
 
@@ -161,8 +205,13 @@ impl Crawler {
             tokio::spawn(async move { me.signal_loop().await })
         };
 
-        for h in handles {
-            let _ = h.await;
+        while let Some(result) = workers.join_next().await {
+            if let Err(e) = result {
+                self.worker_failed.store(true, Ordering::SeqCst);
+                self.shutdown.store(true, Ordering::SeqCst);
+                self.queues.close_all();
+                tracing::error!("worker task failed: {e}");
+            }
         }
         // All workers have returned, so the crawl is definitively over. Under the
         // `--max-nodes` cap, `outstanding` can stay > 0 (queued-but-abandoned
@@ -173,6 +222,13 @@ impl Crawler {
         let _ = monitor.await;
         signals.abort();
         let _ = signals.await;
+        if self.worker_failed.load(Ordering::SeqCst) {
+            anyhow::bail!("one or more worker tasks failed");
+        }
+        if self.output_failed.load(Ordering::SeqCst) {
+            anyhow::bail!("address observation log failed");
+        }
+        Ok(())
     }
 
     /// Wait for Ctrl+C. The first one requests a graceful drain (workers finish
@@ -205,26 +261,60 @@ impl Crawler {
             if self.shutdown.load(Ordering::Relaxed) {
                 return;
             }
-            // Test cap: stop taking work and wake everyone (Section 3.6).
-            if let Some(max) = self.settings.max_nodes {
-                if self.num_processed() >= max {
-                    self.queues.close_all();
-                    return;
-                }
-            }
             let key = match rx.recv().await {
                 Ok(k) => k,
                 Err(_) => return, // queues closed & drained
             };
-            self.num_processed.fetch_add(1, Ordering::SeqCst);
-            self.store.with_entry(&key, |e| e.state = NodeState::Processing);
-            self.process(&key, t).await;
+            if !self.reserve_node_slot() {
+                self.finish(&key, NodeState::BudgetDiscarded, None);
+                self.queues.close_all();
+                continue;
+            }
+            self.store
+                .with_entry(&key, |e| e.state = NodeState::Processing);
+            let me = Arc::clone(self);
+            let task_key = key.clone();
+            let task = tokio::spawn(async move { me.process(&task_key, t).await });
+            if let Err(e) = task.await {
+                tracing::error!("worker panicked while processing {}: {e}", key.render());
+                self.worker_failed.store(true, Ordering::SeqCst);
+                self.shutdown.store(true, Ordering::SeqCst);
+                self.finish(
+                    &key,
+                    NodeState::HandshakeFailed,
+                    Some(FailKind::WorkerFailed),
+                );
+                self.queues.close_all();
+                return;
+            }
         }
+    }
+
+    fn reserve_node_slot(&self) -> bool {
+        let reserved = match self.settings.max_nodes {
+            None => {
+                self.num_processed.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            Some(max) => self
+                .num_processed
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    (n < max).then_some(n + 1)
+                })
+                .is_ok(),
+        };
+        if !reserved {
+            self.node_limit_reached.store(true, Ordering::SeqCst);
+        }
+        reserved
     }
 
     /// Process one address: connect → handshake → getaddr, updating the store.
     async fn process(self: &Arc<Self>, key: &AddrKey, t: Transport) {
-        let network = classify(&key.host);
+        let network = self
+            .store
+            .network_of(key)
+            .unwrap_or_else(|| classify(&key.host));
         let timeouts = self.settings.timeouts_for(network);
         let max_attempts = self.settings.node_settings.handshake_attempts;
 
@@ -233,6 +323,13 @@ impl Crawler {
             .store
             .with_entry(key, |e| {
                 e.stats.handshake_attempts += 1;
+                e.attempts.push(AttemptData {
+                    attempt: e.stats.handshake_attempts,
+                    connect_duration_ms: None,
+                    version_send_timestamp: None,
+                    outcome: "started".to_string(),
+                    failure: None,
+                });
                 e.stats.handshake_attempts
             })
             .unwrap_or(1);
@@ -246,6 +343,7 @@ impl Crawler {
             Ok(c) => c,
             Err(e) => {
                 let kind = classify_connect_error(&e, network);
+                self.update_attempt(key, "connect_failed", Some(kind), None, None);
                 tracing::debug!(
                     "connect failed for {} [{}]: {e}",
                     key.render(),
@@ -273,27 +371,50 @@ impl Crawler {
         let connect_ms = connect_start.elapsed().as_millis() as u64;
         self.store
             .with_entry(key, |e| e.stats.time_connect_ms = Some(connect_ms));
+        self.update_attempt(key, "connected", None, Some(connect_ms), None);
 
         let mut conn = conn;
 
         // 2–5. Handshake (Section 3.2).
-        match self
-            .handshake(&mut conn, key, &timeouts, network)
-            .await
-        {
+        match self.handshake(&mut conn, key, &timeouts, network).await {
             HandshakeResult::Version(v, sent_ts, duration_ms) => {
-                let hd = HandshakeData::from_version(&v, sent_ts, duration_ms);
+                let hd = HandshakeData::from_version(
+                    &v,
+                    sent_ts,
+                    duration_ms,
+                    key.render(),
+                    key.render(),
+                    conn.socket_local().to_string(),
+                    conn.socket_peer().to_string(),
+                );
                 self.store.with_entry(key, |e| {
                     e.handshake = Some(hd.clone());
                 });
                 // 3.3 peer discovery — skipped in direct-probe mode so the run
                 // never enqueues addresses beyond the seeded node list.
                 if !self.settings.probe_mode {
-                    self.getaddr(&mut conn, key, &timeouts, network, &hd).await;
+                    let outcome = self.getaddr(&mut conn, key, &timeouts, network, &hd).await;
+                    let _observation = self.observation_barrier.read().await;
+                    self.store
+                        .with_entry(key, |e| e.stats.collection_outcome = outcome);
+                    if let Some(log) = &self.addr_log {
+                        if let Err(e) = log.write_outcome(&key.host, key.port, outcome).await {
+                            tracing::error!("address-log outcome write failed: {e}");
+                            self.output_failed.store(true, Ordering::SeqCst);
+                        }
+                    }
                 }
+                self.update_attempt(key, "handshake_complete", None, None, Some(sent_ts));
                 self.finish(key, NodeState::Reachable, None);
             }
             HandshakeResult::Timeout => {
+                self.update_attempt(
+                    key,
+                    "handshake_timeout",
+                    Some(FailKind::HandshakeTimeout),
+                    None,
+                    None,
+                );
                 // Full-deadline silence: do not retry unless configured (6.2).
                 let should_retry = self.settings.retry_on_timeout && attempt < max_attempts;
                 self.retry_or_finish(
@@ -305,6 +426,7 @@ impl Crawler {
                 );
             }
             HandshakeResult::Failed(kind) => {
+                self.update_attempt(key, "handshake_failed", Some(kind), None, None);
                 // Mid-handshake transport/protocol error: retry if attempts
                 // remain (6.2), otherwise record the specific reason.
                 self.retry_or_finish(
@@ -317,6 +439,30 @@ impl Crawler {
             }
         }
         // Disconnect happens by dropping `conn`.
+    }
+
+    fn update_attempt(
+        &self,
+        key: &AddrKey,
+        outcome: &str,
+        failure: Option<FailKind>,
+        connect_duration_ms: Option<u64>,
+        version_send_timestamp: Option<i64>,
+    ) {
+        self.store.with_entry(key, |e| {
+            if let Some(a) = e.attempts.last_mut() {
+                a.outcome = outcome.to_string();
+                if failure.is_some() {
+                    a.failure = failure;
+                }
+                if connect_duration_ms.is_some() {
+                    a.connect_duration_ms = connect_duration_ms;
+                }
+                if version_send_timestamp.is_some() {
+                    a.version_send_timestamp = version_send_timestamp;
+                }
+            }
+        });
     }
 
     /// Retry-or-give-up decision shared by the connect and handshake failure paths
@@ -386,7 +532,23 @@ impl Crawler {
                     .sam_session(connect_timeout)
                     .await
                     .ok_or_else(|| std::io::Error::other("no SAM session"))?;
-                session.connect(&key.host, connect_timeout).await?
+                match session.connect(&key.host, connect_timeout).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        // A failed STREAM CONNECT normally describes only the
+                        // requested destination (for example CANT_REACH_PEER or
+                        // TIMEOUT). Keep the shared session in those cases;
+                        // INVALID_ID specifically means the router no longer
+                        // knows the cached session.
+                        if e.to_string().contains("RESULT=INVALID_ID") {
+                            let mut cached = self.sam.lock().await;
+                            if cached.as_ref().is_some_and(|s| Arc::ptr_eq(s, &session)) {
+                                *cached = None;
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
             }
             NetworkType::Unknown => {
                 return Err(std::io::Error::other(
@@ -400,18 +562,21 @@ impl Crawler {
     /// Get (or lazily create) the shared SAM session (Section 4.2.2).
     async fn sam_session(&self, connect_timeout: Duration) -> Option<Arc<SamSession>> {
         let ns = &self.settings.node_settings.network_settings;
-        self.sam
-            .get_or_init(|| async {
-                match SamSession::create(&ns.i2p_sam_host, ns.i2p_sam_port, connect_timeout).await {
-                    Ok(s) => Some(Arc::new(s)),
-                    Err(e) => {
-                        tracing::warn!("failed to create SAM session: {e}");
-                        None
-                    }
-                }
-            })
-            .await
-            .clone()
+        let mut cached = self.sam.lock().await;
+        if let Some(session) = cached.as_ref() {
+            return Some(Arc::clone(session));
+        }
+        match SamSession::create(&ns.i2p_sam_host, ns.i2p_sam_port, connect_timeout).await {
+            Ok(s) => {
+                let session = Arc::new(s);
+                *cached = Some(Arc::clone(&session));
+                Some(session)
+            }
+            Err(e) => {
+                tracing::warn!("failed to create SAM session (will retry): {e}");
+                None
+            }
+        }
     }
 
     /// Perform the version handshake (Section 3.2 steps 2–5).
@@ -424,24 +589,27 @@ impl Crawler {
     ) -> HandshakeResult {
         let start = Instant::now();
         let sent_ts = now_epoch();
-        // Record the first version-send timestamp (Section 7.4).
-        self.store.with_entry(key, |e| {
-            if e.stats.first_version_send_ts.is_none() {
-                e.stats.first_version_send_ts = Some(sent_ts);
-            }
-        });
-
         // Send our version.
         let nonce = rand::random::<u64>();
         let payload = build_version(sent_ts, nonce);
         if conn.send("version", &payload).await.is_err() {
             return HandshakeResult::Failed(FailKind::VersionSendFailed);
         }
+        // Record only a version message that was successfully written.
+        self.store.with_entry(key, |e| {
+            if e.stats.first_version_send_ts.is_none() {
+                e.stats.first_version_send_ts = Some(sent_ts);
+            }
+        });
+        self.update_attempt(key, "version_sent", None, None, Some(sent_ts));
 
         // Wait for the peer's version (Section 3.2 step 3, 4.1 receive loop).
         let deadline = start + Duration::from_secs(timeouts.message);
         let per = Duration::from_secs(timeouts.message);
-        let peer_version = match self.recv_matching(conn, &["version"], deadline, per).await {
+        let peer_version = match self
+            .recv_matching(conn, &["version"], deadline, per, None)
+            .await
+        {
             RecvResult::Message(env) => match parse_version(&env.payload) {
                 Some(v) => v,
                 None => return HandshakeResult::Failed(FailKind::MalformedVersion),
@@ -452,11 +620,29 @@ impl Crawler {
             }
         };
 
-        let duration_ms = start.elapsed().as_millis() as u64;
+        // BIP155 negotiation must be between version and verack and only when
+        // both sides support it.
+        if peer_version.version.min(crate::protocol::PROTOCOL_VERSION) >= 70016
+            && conn.send("sendaddrv2", &[]).await.is_err()
+        {
+            return HandshakeResult::Failed(FailKind::NegotiationSendFailed);
+        }
+        if conn.send("verack", &[]).await.is_err() {
+            return HandshakeResult::Failed(FailKind::VerackSendFailed);
+        }
 
-        // Step 4: send sendaddrv2 then verack.
-        let _ = conn.send("sendaddrv2", &[]).await;
-        let _ = conn.send("verack", &[]).await;
+        match self
+            .recv_matching(conn, &["verack"], deadline, per, Some(peer_version.version))
+            .await
+        {
+            RecvResult::Message(_) => {}
+            RecvResult::Timeout => return HandshakeResult::Failed(FailKind::PeerVerackTimeout),
+            RecvResult::Transport(e) => {
+                return HandshakeResult::Failed(classify_handshake_error(&e));
+            }
+        }
+
+        let duration_ms = start.elapsed().as_millis() as u64;
 
         HandshakeResult::Version(peer_version, sent_ts, duration_ms)
     }
@@ -469,6 +655,7 @@ impl Crawler {
         expected: &[&str],
         deadline: Instant,
         per_timeout: Duration,
+        ping_version: Option<i32>,
     ) -> RecvResult {
         loop {
             let now = Instant::now();
@@ -482,7 +669,11 @@ impl Crawler {
                         return RecvResult::Message(env);
                     }
                     if env.command == "ping" {
-                        let _ = conn.answer_ping(&env.payload).await;
+                        if let Some(version) = ping_version {
+                            if let Err(e) = conn.answer_ping(&env.payload, version).await {
+                                return RecvResult::Transport(e);
+                            }
+                        }
                     }
                     // else: unmatched, skip and keep waiting.
                 }
@@ -503,45 +694,129 @@ impl Crawler {
         timeouts: &crate::settings::Timeouts,
         _network: NetworkType,
         hd: &HandshakeData,
-    ) {
+    ) -> CollectionOutcome {
         if conn.send("getaddr", &[]).await.is_err() {
-            return;
+            return CollectionOutcome::SendFailed;
         }
         let start = Instant::now();
-        let deadline = start + Duration::from_secs(timeouts.getaddr);
+        let hard_deadline = start + Duration::from_secs(timeouts.getaddr);
+        let first_deadline = start + Duration::from_secs(timeouts.message.min(timeouts.getaddr));
         let idle = Duration::from_secs(timeouts.getaddr_idle);
+        let mut quiet_deadline: Option<Instant> = None;
+        let mut valid_messages = 0u64;
 
         loop {
             let now = Instant::now();
+            let phase_deadline = quiet_deadline.unwrap_or(first_deadline);
+            let deadline = phase_deadline.min(hard_deadline);
             if now >= deadline {
-                break;
+                return if valid_messages == 0 {
+                    if deadline == hard_deadline {
+                        CollectionOutcome::HardTimeout
+                    } else {
+                        CollectionOutcome::NoResponseTimeout
+                    }
+                } else if deadline == hard_deadline {
+                    CollectionOutcome::PartialHardTimeout
+                } else {
+                    CollectionOutcome::CompleteQuiet
+                };
             }
-            let wait = (deadline - now).min(idle);
+            let wait = deadline - now;
             match conn.recv_one(wait).await {
                 Ok(Some(env)) => match env.command.as_str() {
-                    "addr" => {
-                        let addrs = parse_addr(&env.payload);
-                        let n = addrs.len();
-                        self.handle_addr_message(key, "addr", &addrs, hd).await;
-                        if is_getaddr_reply_complete(n) {
-                            break;
+                    "addr" | "addrv2" => {
+                        let parsed = if env.command == "addr" {
+                            parse_addr(&env.payload)
+                        } else {
+                            parse_addrv2(&env.payload)
+                        };
+                        let parsed = match parsed {
+                            Ok(parsed) => parsed,
+                            Err(e) => {
+                                let _observation = self.observation_barrier.read().await;
+                                tracing::debug!(
+                                    "malformed {} from {}: {e}",
+                                    env.command,
+                                    key.render()
+                                );
+                                self.store.with_entry(key, |entry| {
+                                    entry.stats.malformed_addr_messages += 1
+                                });
+                                if let Some(log) = &self.addr_log {
+                                    if let Err(log_error) = log
+                                        .write_malformed(
+                                            &key.host,
+                                            key.port,
+                                            &env.command,
+                                            &e,
+                                            &env.payload,
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!("failed to quarantine malformed address response: {log_error}");
+                                        self.output_failed.store(true, Ordering::SeqCst);
+                                        return CollectionOutcome::LogFailed;
+                                    }
+                                }
+                                return if valid_messages == 0 {
+                                    CollectionOutcome::MalformedResponse
+                                } else {
+                                    CollectionOutcome::PartialMalformedResponse
+                                };
+                            }
+                        };
+                        if self
+                            .handle_addr_message(key, &env.command, &parsed, hd)
+                            .await
+                            .is_err()
+                        {
+                            self.output_failed.store(true, Ordering::SeqCst);
+                            return CollectionOutcome::LogFailed;
                         }
+                        valid_messages += 1;
+                        self.store
+                            .with_entry(key, |entry| entry.stats.valid_addr_messages += 1);
+                        quiet_deadline = Some(Instant::now() + idle);
                     }
-                    "addrv2" => {
-                        let addrs = parse_addrv2(&env.payload);
-                        let n = addrs.len();
-                        self.handle_addr_message(key, "addrv2", &addrs, hd).await;
-                        if is_getaddr_reply_complete(n) {
-                            break;
-                        }
+                    "ping" if conn.answer_ping(&env.payload, hd.version).await.is_err() => {
+                        return if valid_messages == 0 {
+                            CollectionOutcome::RemoteDisconnect
+                        } else {
+                            CollectionOutcome::PartialRemoteDisconnect
+                        };
                     }
-                    "ping" => {
-                        let _ = conn.answer_ping(&env.payload).await;
-                    }
+                    "ping" => {}
                     _ => { /* skip */ }
                 },
-                Ok(None) => break, // idle timeout: peer quiet, done
-                Err(_) => break,   // transport error: done with what we collected
+                Ok(None) => {
+                    if conn.has_partial_envelope() {
+                        return if valid_messages == 0 {
+                            CollectionOutcome::IncompleteEnvelopeTimeout
+                        } else {
+                            CollectionOutcome::PartialIncompleteEnvelopeTimeout
+                        };
+                    }
+                    return if valid_messages == 0 {
+                        CollectionOutcome::NoResponseTimeout
+                    } else {
+                        CollectionOutcome::CompleteQuiet
+                    };
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::TimedOut {
+                        return if valid_messages == 0 {
+                            CollectionOutcome::IncompleteEnvelopeTimeout
+                        } else {
+                            CollectionOutcome::PartialIncompleteEnvelopeTimeout
+                        };
+                    }
+                    return if valid_messages == 0 {
+                        CollectionOutcome::RemoteDisconnect
+                    } else {
+                        CollectionOutcome::PartialRemoteDisconnect
+                    };
+                }
             }
         }
     }
@@ -551,9 +826,13 @@ impl Crawler {
         &self,
         responder: &AddrKey,
         message_type: &str,
-        addrs: &[AdvertisedAddr],
+        parsed: &ParsedAddrMessage,
         hd: &HandshakeData,
-    ) {
+    ) -> std::io::Result<()> {
+        // Checkpoints take the write side while flushing the observation log
+        // and cloning aggregate state, preventing a provenance/aggregate split.
+        let _observation = self.observation_barrier.read().await;
+        let addrs = &parsed.addrs;
         let now = now_epoch();
 
         // Step 4: per-node breakdown counts ALL advertised addresses.
@@ -561,6 +840,8 @@ impl Crawler {
             for a in addrs {
                 e.stats.record_advertised(a.network);
             }
+            e.stats.advertised_total += parsed.unknown_entries;
+            e.stats.advertised_unknown += parsed.unknown_entries;
         });
 
         // Step 5: addr-response log, recorded before dedup (Section 8.5).
@@ -574,7 +855,7 @@ impl Crawler {
                 message_type,
                 handshake: hd,
             };
-            log.write_block(&r, addrs).await;
+            log.write_block(&r, parsed).await?;
         }
 
         // Steps 0/3/6: feed enabled-network addresses into the frontier.
@@ -596,8 +877,11 @@ impl Crawler {
             );
             if outcome == FrontierOutcome::Enqueue {
                 self.enqueue(akey);
+            } else if outcome == FrontierOutcome::BudgetRejected {
+                tracing::debug!("frontier address budget rejected {}", akey.render());
             }
         }
+        Ok(())
     }
 
     /// Status monitor loop (Section 3.8).
@@ -612,9 +896,7 @@ impl Crawler {
                 tracing::info!("[STATUS] No more nodes and no active workers: exiting");
                 let runtime = self.start_clock.elapsed().as_secs();
                 if runtime > 12 * 3600 {
-                    tracing::warn!(
-                        "[STATUS] crawl runtime exceeded 12h ({runtime}s)"
-                    );
+                    tracing::warn!("[STATUS] crawl runtime exceeded 12h ({runtime}s)");
                 }
                 return;
             }
@@ -685,25 +967,6 @@ fn classify_handshake_error(e: &std::io::Error) -> FailKind {
     }
 }
 
-/// Decide whether an addr/addrv2 message of length `n` completes the getaddr
-/// reply, so the collection loop can stop early instead of waiting for the idle
-/// timeout.
-///
-/// The discriminator is *substance*, not chunk size. Bitcoin Core sends its
-/// self-announcement (the peer's own address) as its own standalone message of
-/// exactly one address, right alongside the getaddr reply (net_processing.cpp
-/// `MaybeSendAddr`). A length-based "sub-1000 means done" test would break on
-/// that self-announcement and miss the real dump, so instead:
-///   - `n >= MAX_ADDR_TO_SEND`: a full chunk; more may follow, keep reading.
-///   - `1 < n < MAX_ADDR_TO_SEND`: the substantive final chunk, we are done.
-///   - `n <= 1`: a self-announcement (or empty); ignore and keep waiting for the
-///     real reply, falling back to the idle timeout if none arrives.
-///
-/// This mirrors Core's own AddrFetch completion rule (`vAddr.size() > 1`).
-fn is_getaddr_reply_complete(n: usize) -> bool {
-    n > 1 && n < MAX_ADDR_TO_SEND
-}
-
 /// Current UNIX epoch seconds.
 pub fn now_epoch() -> i64 {
     std::time::SystemTime::now()
@@ -715,6 +978,7 @@ pub fn now_epoch() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::io::{Error, ErrorKind};
 
     #[test]
@@ -763,18 +1027,6 @@ mod tests {
     }
 
     #[test]
-    fn getaddr_reply_completion_ignores_self_announcements() {
-        // Self-announcement (1 addr) or empty: not the dump, keep waiting.
-        assert!(!is_getaddr_reply_complete(0));
-        assert!(!is_getaddr_reply_complete(1));
-        // Substantive, non-full chunk: the reply is complete.
-        assert!(is_getaddr_reply_complete(2));
-        assert!(is_getaddr_reply_complete(MAX_ADDR_TO_SEND - 1));
-        // Full chunk: more may follow, keep reading.
-        assert!(!is_getaddr_reply_complete(MAX_ADDR_TO_SEND));
-    }
-
-    #[test]
     fn handshake_errors_classify_by_kind() {
         let desync = Error::new(ErrorKind::InvalidData, "network magic mismatch");
         assert_eq!(classify_handshake_error(&desync), FailKind::ProtocolDesync);
@@ -782,5 +1034,29 @@ mod tests {
         assert_eq!(classify_handshake_error(&eof), FailKind::ConnectionClosed);
         let other = Error::other("weird");
         assert_eq!(classify_handshake_error(&other), FailKind::HandshakeOther);
+    }
+
+    #[test]
+    fn node_limit_counts_every_processing_iteration() {
+        let settings = crate::settings::Cli::try_parse_from([
+            "crawler",
+            "--max-nodes",
+            "2",
+            "--no-ipv4",
+            "--no-ipv6",
+            "--no-tor",
+            "--no-i2p",
+            "--no-cjdns",
+        ])
+        .unwrap()
+        .into_settings()
+        .unwrap();
+        let crawler = Crawler::new(Arc::new(NodeStore::new()), Arc::new(settings), None);
+
+        assert!(crawler.reserve_node_slot());
+        assert!(crawler.reserve_node_slot());
+        assert!(!crawler.reserve_node_slot());
+        assert_eq!(crawler.num_processed(), 2);
+        assert!(crawler.terminated_early());
     }
 }

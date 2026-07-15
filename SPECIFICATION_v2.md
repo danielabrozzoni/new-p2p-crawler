@@ -757,7 +757,7 @@ retains (version permitting):
   transport family (`ip`, `tor`, `i2p`; CJDNS rides the `ip` TCP path) has its own
   work queue drained by a pool of exactly `concurrency[T]` workers (Section 3.5), so
   the pool size *is* the concurrency cap and no separate semaphore is needed.
-  Suggested defaults: `ip` = 512, `tor` = 64, `i2p` = 32 (tune to host + side-service
+  Suggested defaults: `ip` = 64, `tor` = 64, `i2p` = 32 (tune to host + side-service
   capacity).
 - **No per-host or global socket cap beyond the pool sizes; no explicit rate
   limiting.** Pacing comes from timeouts + pool sizes.
@@ -1045,7 +1045,7 @@ CLI flags, most with a matching env var default.
 `connect`/`message`/`getaddr`/`getaddr-idle`): `--<net>-<op>-timeout`, env
 `<NET>_<OP>_TIMEOUT`. Defaults in Section 6.1.
 
-**Concurrency**: `--ip-concurrency` (default 512), `--tor-concurrency` (64),
+**Concurrency**: `--ip-concurrency` (default 64), `--tor-concurrency` (64),
 `--i2p-concurrency` (32).
 
 **Crawler behavior**:

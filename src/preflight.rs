@@ -1,6 +1,6 @@
 //! Network preflight probes and the dry-run table (Section 2.5).
 
-use crate::dns::{resolve_seed, ip_to_host, MAINNET_PORT, SEEDS};
+use crate::dns::{ip_to_host, resolve_seed, MAINNET_PORT, SEEDS};
 use crate::settings::Settings;
 use crate::transport::{connect_tcp, sam_probe, socks5_probe};
 use std::time::Duration;
@@ -139,7 +139,10 @@ async fn probe_ip(want_ipv6: bool, connect_timeout: Duration) -> ProbeResult {
             }
             tried += 1;
             let host = ip_to_host(ip);
-            if connect_tcp(&host, MAINNET_PORT, connect_timeout).await.is_ok() {
+            if connect_tcp(&host, MAINNET_PORT, connect_timeout)
+                .await
+                .is_ok()
+            {
                 return ProbeResult::Reachable;
             }
             if tried >= 5 {

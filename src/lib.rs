@@ -4,8 +4,8 @@
 //! `src/main.rs`) and `probe` (direct connect to an explicit node list,
 //! `src/bin/probe.rs`).
 
-pub mod addrlog;
 pub mod address;
+pub mod addrlog;
 pub mod crawler;
 pub mod dns;
 pub mod logging;
